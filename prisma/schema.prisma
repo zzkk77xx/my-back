@@ -24,10 +24,17 @@ model SpendAuthorizedEvent {
   createdAt       DateTime @default(now())
 
   // Withdrawal execution tracking
-  // Status: "pending" | "processing" | "done" | "failed" | "no_recipient"
+  // Status: "pending" | "processing" | "done" | "failed" | "no_recipient" | "dead_letter"
   withdrawalStatus  String  @default("pending")
   withdrawalRelayId String? // relayId from Unlink once submitted
   withdrawalError   String? // error message if status = "failed"
+
+  // Retry logic
+  retryCount  Int       @default(0)
+  nextRetryAt DateTime?
+
+  // Timing decorrelation — random delay before execution
+  scheduledAt DateTime?
 
   @@unique([txHash, logIndex])
   @@map("spend_authorized_events")
@@ -119,6 +126,21 @@ model SubAccount {
   updatedAt    DateTime @updatedAt
 
   @@map("sub_accounts")
+}
+
+// Per-user beneficiary registry (known recipients)
+model BeneficiaryRegistry {
+  id            Int      @id @default(autoincrement())
+  userId        Int
+  recipientHash String   @db.VarChar(66) // keccak256(abi.encodePacked(address))
+  address       String   @db.VarChar(42) // actual 0x-prefixed recipient
+  label         String?
+  status        String   @default("approved") // "approved" | "pending" | "blocked"
+  createdAt     DateTime @default(now())
+
+  @@unique([userId, recipientHash])
+  @@index([userId])
+  @@map("beneficiary_registry")
 }
 
 // Compliance audit trail for all auto-sign / pool / withdrawal decisions

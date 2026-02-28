@@ -18,6 +18,14 @@ import { SPEND_INTERACTOR_ABI } from "./safe.js";
 // $10,000 in 18-decimal
 export const AUTO_SIGN_LIMIT_USD = 10_000n * 10n ** 18n;
 
+// Velocity limits (18-decimal USD). Off-chain complement to on-chain 24h limit.
+export const VELOCITY_7D_LIMIT_USD = BigInt(
+  process.env.VELOCITY_7D_LIMIT_USD ?? (50_000n * 10n ** 18n).toString(),
+);
+export const VELOCITY_30D_LIMIT_USD = BigInt(
+  process.env.VELOCITY_30D_LIMIT_USD ?? (150_000n * 10n ** 18n).toString(),
+);
+
 export interface SpendIntent {
   userAddress: string;
   amount: string; // 18-decimal string
@@ -30,12 +38,16 @@ export interface ValidationResult {
   reason?: string;
   remainingDaily?: string;
   remainingBalance?: string;
+  remaining7d?: string;
+  remaining30d?: string;
+  recipientKnown?: boolean;
+  firstTimeRecipient?: boolean;
 }
 
 export async function validateSpendIntent(
   prisma: PrismaClient,
   publicClient: PublicClient,
-  intent: SpendIntent
+  intent: SpendIntent,
 ): Promise<ValidationResult> {
   const { userAddress, amount, transferType } = intent;
   const amountBn = BigInt(amount);
@@ -61,17 +73,90 @@ export async function validateSpendIntent(
     };
   }
 
-  // 4. Sufficient deposited balance
+  // 4. Velocity checks (7d / 30d rolling spend limits)
+  const now = new Date();
+  const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+  const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+  const recentSpends = await prisma.balanceLedger.findMany({
+    where: {
+      userId: user.id,
+      token: "usd",
+      type: "spend",
+      createdAt: { gte: thirtyDaysAgo },
+    },
+    select: { amount: true, createdAt: true },
+  });
+
+  let spend7d = 0n;
+  let spend30d = 0n;
+  for (const entry of recentSpends) {
+    const amt = BigInt(entry.amount);
+    spend30d += amt;
+    if (entry.createdAt >= sevenDaysAgo) {
+      spend7d += amt;
+    }
+  }
+
+  const remaining7d = VELOCITY_7D_LIMIT_USD - spend7d;
+  const remaining30d = VELOCITY_30D_LIMIT_USD - spend30d;
+
+  if (spend7d + amountBn > VELOCITY_7D_LIMIT_USD) {
+    return {
+      allowed: false,
+      reason: "Exceeds 7-day rolling spend limit",
+      remaining7d: remaining7d.toString(),
+      remaining30d: remaining30d.toString(),
+    };
+  }
+
+  if (spend30d + amountBn > VELOCITY_30D_LIMIT_USD) {
+    return {
+      allowed: false,
+      reason: "Exceeds 30-day rolling spend limit",
+      remaining7d: remaining7d.toString(),
+      remaining30d: remaining30d.toString(),
+    };
+  }
+
+  // 5. Beneficiary registry check
+  if (intent.recipientHash) {
+    const beneficiary = await prisma.beneficiaryRegistry.findUnique({
+      where: {
+        userId_recipientHash: {
+          userId: user.id,
+          recipientHash: intent.recipientHash.toLowerCase(),
+        },
+      },
+    });
+
+    if (beneficiary?.status === "blocked") {
+      return {
+        allowed: false,
+        reason: "Recipient is blocked",
+        remaining7d: remaining7d.toString(),
+        remaining30d: remaining30d.toString(),
+      };
+    }
+
+    // Flag first-time recipients (non-blocking warning)
+    var recipientKnown = !!beneficiary;
+    var firstTimeRecipient = !beneficiary;
+  }
+
+  // 6. Sufficient deposited balance
   const balance = await getBalance(prisma, user.id, "usd");
   if (BigInt(balance) < amountBn) {
     return {
       allowed: false,
       reason: "Insufficient deposited balance",
       remainingBalance: balance,
+      remaining7d: remaining7d.toString(),
+      remaining30d: remaining30d.toString(),
     };
   }
 
-  // 5. On-chain daily limit check
+  // 7. On-chain daily limit check
   let remainingDaily: bigint;
   try {
     remainingDaily = (await publicClient.readContract({
@@ -87,6 +172,8 @@ export async function validateSpendIntent(
         reason: "Exceeds on-chain daily spending limit",
         remainingDaily: remainingDaily.toString(),
         remainingBalance: balance,
+        remaining7d: remaining7d.toString(),
+        remaining30d: remaining30d.toString(),
       };
     }
   } catch (err) {
@@ -95,10 +182,12 @@ export async function validateSpendIntent(
       allowed: false,
       reason: `On-chain limit check failed: ${err instanceof Error ? err.message : String(err)}`,
       remainingBalance: balance,
+      remaining7d: remaining7d.toString(),
+      remaining30d: remaining30d.toString(),
     };
   }
 
-  // 6. Transfer type allowed (if specified)
+  // 8. Transfer type allowed (if specified)
   if (transferType !== undefined) {
     try {
       const bitmap = (await publicClient.readContract({
@@ -115,6 +204,8 @@ export async function validateSpendIntent(
           reason: `Transfer type ${transferType} not allowed for this EOA`,
           remainingDaily: remainingDaily.toString(),
           remainingBalance: balance,
+          remaining7d: remaining7d.toString(),
+          remaining30d: remaining30d.toString(),
         };
       }
     } catch (err) {
@@ -123,6 +214,8 @@ export async function validateSpendIntent(
         reason: `Transfer type check failed: ${err instanceof Error ? err.message : String(err)}`,
         remainingDaily: remainingDaily.toString(),
         remainingBalance: balance,
+        remaining7d: remaining7d.toString(),
+        remaining30d: remaining30d.toString(),
       };
     }
   }
@@ -131,5 +224,9 @@ export async function validateSpendIntent(
     allowed: true,
     remainingDaily: remainingDaily.toString(),
     remainingBalance: balance,
+    remaining7d: remaining7d.toString(),
+    remaining30d: remaining30d.toString(),
+    recipientKnown: recipientKnown ?? undefined,
+    firstTimeRecipient: firstTimeRecipient ?? undefined,
   };
 }

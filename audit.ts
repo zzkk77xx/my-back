@@ -15,9 +15,14 @@ export const AUDIT_ACTIONS = {
   AUTO_SIGN_REJECTED: "auto_sign_rejected",
   WITHDRAWAL_EXECUTED: "withdrawal_executed",
   WITHDRAWAL_FAILED: "withdrawal_failed",
+  WITHDRAWAL_RETRY: "withdrawal_retry",
+  WITHDRAWAL_DLQ: "withdrawal_dlq",
   DEPOSIT_RECORDED: "deposit_recorded",
   POOL_TOPUP: "pool_topup",
   POOL_TOPUP_FAILED: "pool_topup_failed",
+  POOL_SWEEP: "pool_sweep",
+  POOL_SWEEP_FAILED: "pool_sweep_failed",
+  INTERNAL_TRANSFER: "internal_transfer",
 } as const;
 
 export type AuditAction = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];
@@ -29,7 +34,7 @@ export async function logAudit(
   prisma: PrismaClient,
   action: AuditAction,
   userId: number | null,
-  details: Record<string, unknown>
+  details: Record<string, unknown>,
 ): Promise<void> {
   try {
     await prisma.auditLog.create({
@@ -42,7 +47,7 @@ export async function logAudit(
   } catch (err) {
     console.error(
       "[audit] Failed to write audit log:",
-      err instanceof Error ? err.message : err
+      err instanceof Error ? err.message : err,
     );
   }
 }
@@ -57,7 +62,7 @@ export async function queryAuditLogs(
     userId?: number;
     limit?: number;
     offset?: number;
-  } = {}
+  } = {},
 ) {
   const { action, userId, limit = 50, offset = 0 } = opts;
 

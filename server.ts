@@ -19,7 +19,13 @@ import { PrismaClient } from "@prisma/client";
 import { initUnlink, type Unlink } from "@unlink-xyz/node";
 import cors from "cors";
 import express, { type Request, type Response } from "express";
-import { createPublicClient, createWalletClient, encodePacked, http, keccak256 } from "viem";
+import {
+  createPublicClient,
+  createWalletClient,
+  encodePacked,
+  http,
+  keccak256,
+} from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { requirePrivyAuth } from "./auth.js";
 import { processProposal, type SafeTxProposal } from "./auto-sign.js";
@@ -28,7 +34,7 @@ import { creditBalance, getAllBalances } from "./ledger.js";
 import { validateSpendIntent } from "./policy.js";
 import { getPoolStatus, startPoolMonitor } from "./pool.js";
 import { SPEND_INTERACTOR_ABI, deployUserSafe } from "./safe.js";
-import { startWatcher } from "./watcher.js";
+import { lastPollAt, startWatcher } from "./watcher.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -39,6 +45,9 @@ const DEFAULT_RECIPIENT = process.env.SAFE_ADDRESS as `0x${string}` | undefined;
 const PORT = Number(process.env.PORT ?? 3000);
 const CHAIN_ID = Number(process.env.CHAIN_ID ?? 10143);
 const RPC_URL = process.env.RPC_URL!;
+const DEFAULT_TOKEN_ADDRESS = (process.env.DEFAULT_TOKEN_ADDRESS ??
+  process.env.POOL_TOKEN_ADDRESS) as `0x${string}` | undefined;
+const DEFAULT_TOKEN_DECIMALS = Number(process.env.DEFAULT_TOKEN_DECIMALS ?? 6);
 
 // viem clients reused for EOA registration calls
 const _chain = {
@@ -53,10 +62,17 @@ const _adminAccount = process.env.ADMIN_PRIVATE_KEY
   : undefined;
 
 const _walletClient = _adminAccount
-  ? createWalletClient({ account: _adminAccount, transport: http(RPC_URL), chain: _chain })
+  ? createWalletClient({
+      account: _adminAccount,
+      transport: http(RPC_URL),
+      chain: _chain,
+    })
   : undefined;
 
-const _publicClient = createPublicClient({ transport: http(RPC_URL), chain: _chain });
+const _publicClient = createPublicClient({
+  transport: http(RPC_URL),
+  chain: _chain,
+});
 
 // ─── Singletons ───────────────────────────────────────────────────────────────
 
@@ -76,46 +92,174 @@ async function initWallet() {
   console.log("Wallet ready. Active account:", account!.address);
 }
 
+// Pending deposit metadata — keyed by relayId, populated by /deposit/prepare,
+// consumed by /deposit/confirm to auto-credit the user's ledger balance.
+// In-memory is fine: Unlink wallet state is also ephemeral (re-derived on boot).
+interface PendingDeposit {
+  depositor: string; // user EOA
+  token: string; // ERC-20 address
+  amount: string; // token-unit amount string
+}
+const pendingDeposits = new Map<string, PendingDeposit>();
+
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+const startedAt = Date.now();
+
+// ─── GET /health ─────────────────────────────────────────────────────────────
+
+app.get("/health", async (_req: Request, res: Response) => {
+  const components: Record<string, { status: string; [k: string]: unknown }> =
+    {};
+
+  // Database check
+  try {
+    const dbStart = Date.now();
+    await prisma.$queryRaw`SELECT 1`;
+    components.database = { status: "up", latencyMs: Date.now() - dbStart };
+  } catch (err) {
+    components.database = {
+      status: "down",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  // Watcher check
+  const pendingCount = await prisma.spendAuthorizedEvent
+    .count({
+      where: { withdrawalStatus: "pending" },
+    })
+    .catch(() => -1);
+
+  const dlqCount = await prisma.spendAuthorizedEvent
+    .count({
+      where: { withdrawalStatus: "dead_letter" },
+    })
+    .catch(() => -1);
+
+  components.watcher = {
+    status: lastPollAt ? "up" : "starting",
+    lastPollAt: lastPollAt?.toISOString() ?? null,
+    pendingEvents: pendingCount,
+    deadLetterEvents: dlqCount,
+  };
+
+  // Pool check
+  try {
+    const poolStatus = await getPoolStatus(unlink);
+    components.pool = {
+      status: "up",
+      isHealthy: poolStatus.isHealthy,
+      currentBalance: poolStatus.currentBalance,
+    };
+  } catch (err) {
+    components.pool = {
+      status: "down",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  // Unlink check
+  try {
+    const account = await unlink.accounts.getActive();
+    components.unlink = { status: account ? "up" : "down" };
+  } catch (err) {
+    components.unlink = {
+      status: "down",
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  // Overall status
+  const dbUp = components.database.status === "up";
+  const unlinkUp = components.unlink.status === "up";
+  const overallStatus =
+    dbUp && unlinkUp ? "healthy" : dbUp || unlinkUp ? "degraded" : "unhealthy";
+
+  const statusCode = overallStatus === "unhealthy" ? 503 : 200;
+
+  res.status(statusCode).json({
+    status: overallStatus,
+    uptime: Math.floor((Date.now() - startedAt) / 1000),
+    components,
+  });
+});
+
 // ─── POST /users/register ─────────────────────────────────────────────────────
 //
 // Body: { address: "0x..." }
 // Idempotent: returns the existing Safe address if the user is already registered.
 
-app.post("/users/register", requirePrivyAuth, async (req: Request, res: Response) => {
-  const { address } = req.body as { address: string };
+app.post(
+  "/users/register",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { address } = req.body as { address: string };
 
-  if (!address) {
-    res.status(400).json({ error: "address is required" });
-    return;
-  }
+    if (!address) {
+      res.status(400).json({ error: "address is required" });
+      return;
+    }
 
-  const normalized = address.toLowerCase();
+    const normalized = address.toLowerCase();
 
-  // Return early if already registered
-  const existing = await prisma.user.findUnique({ where: { address: normalized } });
-  if (existing) {
-    res.json({ safeAddress: existing.safeAddress, created: false });
-    return;
-  }
+    // Return early if already registered
+    const existing = await prisma.user.findUnique({
+      where: { address: normalized },
+    });
+    if (existing) {
+      res.json({ safeAddress: existing.safeAddress, created: false });
+      return;
+    }
 
-  const { safeAddress, spendInteractorAddress } = await deployUserSafe(address);
+    const { safeAddress, spendInteractorAddress } =
+      await deployUserSafe(address);
 
-  const user = await prisma.user.create({
-    data: {
-      address: normalized,
-      safeAddress: safeAddress.toLowerCase(),
-      spendInteractorAddress: spendInteractorAddress.toLowerCase(),
-    },
-  });
+    const user = await prisma.user.create({
+      data: {
+        address: normalized,
+        safeAddress: safeAddress.toLowerCase(),
+        spendInteractorAddress: spendInteractorAddress.toLowerCase(),
+      },
+    });
 
-  res.status(201).json({ safeAddress: user.safeAddress, created: true });
-});
+    // Auto-register SpendInteractor as a WatchedContract so the watcher
+    // picks up SpendAuthorized events for this user.
+    if (DEFAULT_TOKEN_ADDRESS) {
+      await prisma.watchedContract.upsert({
+        where: { address: spendInteractorAddress.toLowerCase() },
+        create: {
+          address: spendInteractorAddress.toLowerCase(),
+          tokenAddress: DEFAULT_TOKEN_ADDRESS.toLowerCase(),
+          tokenDecimals: DEFAULT_TOKEN_DECIMALS,
+          label: `user:${normalized}`,
+        },
+        update: {},
+      });
+    }
+
+    // Auto-register RecipientMapping so withdrawals to this user resolve.
+    // Hash convention: keccak256(abi.encodePacked(address))
+    const recipientHash = keccak256(
+      encodePacked(["address"], [address as `0x${string}`]),
+    );
+    await prisma.recipientMapping.upsert({
+      where: { hash: recipientHash },
+      create: {
+        hash: recipientHash,
+        address: normalized,
+        label: `user:${normalized}`,
+      },
+      update: {},
+    });
+
+    res.status(201).json({ safeAddress: user.safeAddress, created: true });
+  },
+);
 
 // ─── POST /users/:userAddress/eoas ────────────────────────────────────────────
 //
@@ -123,43 +267,53 @@ app.post("/users/register", requirePrivyAuth, async (req: Request, res: Response
 // Body: { eoa: "0x...", dailyLimit: "1000000000000000000", allowedTypes: [0, 1] }
 // Admin calls registerEOA() directly (SpendInteractor owner = admin).
 
-app.post("/users/:userAddress/eoas", requirePrivyAuth, async (req: Request, res: Response) => {
-  const { userAddress } = req.params;
-  const { eoa, dailyLimit, allowedTypes } = req.body as {
-    eoa: string;
-    dailyLimit: string;
-    allowedTypes: number[];
-  };
+app.post(
+  "/users/:userAddress/eoas",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { userAddress } = req.params;
+    const { eoa, dailyLimit, allowedTypes } = req.body as {
+      eoa: string;
+      dailyLimit: string;
+      allowedTypes: number[];
+    };
 
-  if (!eoa || !dailyLimit || !allowedTypes) {
-    res.status(400).json({ error: "eoa, dailyLimit, and allowedTypes are required" });
-    return;
-  }
+    if (!eoa || !dailyLimit || !allowedTypes) {
+      res
+        .status(400)
+        .json({ error: "eoa, dailyLimit, and allowedTypes are required" });
+      return;
+    }
 
-  if (!_walletClient || !_adminAccount) {
-    res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
-    return;
-  }
+    if (!_walletClient || !_adminAccount) {
+      res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+      return;
+    }
 
-  const user = await prisma.user.findUnique({
-    where: { address: userAddress.toLowerCase() },
-  });
-  if (!user) {
-    res.status(404).json({ error: "User not found" });
-    return;
-  }
+    const user = await prisma.user.findUnique({
+      where: { address: userAddress.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
 
-  const txHash = await _walletClient.writeContract({
-    address: user.spendInteractorAddress as `0x${string}`,
-    abi: SPEND_INTERACTOR_ABI,
-    functionName: "registerEOA",
-    args: [eoa as `0x${string}`, BigInt(dailyLimit), allowedTypes],
-  });
+    const txHash = await _walletClient.writeContract({
+      address: user.spendInteractorAddress as `0x${string}`,
+      abi: SPEND_INTERACTOR_ABI,
+      functionName: "registerEOA",
+      args: [eoa as `0x${string}`, BigInt(dailyLimit), allowedTypes],
+    });
 
-  await _publicClient.waitForTransactionReceipt({ hash: txHash });
+    await _publicClient.waitForTransactionReceipt({ hash: txHash });
 
-  res.status(201).json({ txHash, eoa, spendInteractorAddress: user.spendInteractorAddress });
-});
+    res.status(201).json({
+      txHash,
+      eoa,
+      spendInteractorAddress: user.spendInteractorAddress,
+    });
+  },
+);
 
 // ─── GET /users/:userAddress/eoas ─────────────────────────────────────────────
 
@@ -185,33 +339,37 @@ app.get("/users/:userAddress/eoas", async (req: Request, res: Response) => {
 
 // ─── DELETE /users/:userAddress/eoas/:eoa ─────────────────────────────────────
 
-app.delete("/users/:userAddress/eoas/:eoa", requirePrivyAuth, async (req: Request, res: Response) => {
-  const { userAddress, eoa } = req.params;
+app.delete(
+  "/users/:userAddress/eoas/:eoa",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { userAddress, eoa } = req.params;
 
-  if (!_walletClient) {
-    res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
-    return;
-  }
+    if (!_walletClient) {
+      res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+      return;
+    }
 
-  const user = await prisma.user.findUnique({
-    where: { address: userAddress.toLowerCase() },
-  });
-  if (!user) {
-    res.status(404).json({ error: "User not found" });
-    return;
-  }
+    const user = await prisma.user.findUnique({
+      where: { address: userAddress.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
 
-  const txHash = await _walletClient.writeContract({
-    address: user.spendInteractorAddress as `0x${string}`,
-    abi: SPEND_INTERACTOR_ABI,
-    functionName: "revokeEOA",
-    args: [eoa as `0x${string}`],
-  });
+    const txHash = await _walletClient.writeContract({
+      address: user.spendInteractorAddress as `0x${string}`,
+      abi: SPEND_INTERACTOR_ABI,
+      functionName: "revokeEOA",
+      args: [eoa as `0x${string}`],
+    });
 
-  await _publicClient.waitForTransactionReceipt({ hash: txHash });
+    await _publicClient.waitForTransactionReceipt({ hash: txHash });
 
-  res.json({ txHash, eoa });
-});
+    res.json({ txHash, eoa });
+  },
+);
 
 // ─── GET /account ─────────────────────────────────────────────────────────────
 
@@ -225,7 +383,7 @@ app.get("/account", async (_req: Request, res: Response) => {
 app.get("/balances", async (_req: Request, res: Response) => {
   const raw = await unlink.getBalances();
   const balances = Object.fromEntries(
-    Object.entries(raw).map(([token, amount]) => [token, amount.toString()])
+    Object.entries(raw).map(([token, amount]) => [token, amount.toString()]),
   );
   res.json(balances);
 });
@@ -244,13 +402,22 @@ app.post("/deposit/prepare", async (req: Request, res: Response) => {
   };
 
   if (!depositor || !token || !amount) {
-    res.status(400).json({ error: "depositor, token, and amount are required" });
+    res
+      .status(400)
+      .json({ error: "depositor, token, and amount are required" });
     return;
   }
 
   const deposit = await unlink.deposit({
     depositor: depositor as `0x${string}`,
     deposits: [{ token: token as `0x${string}`, amount: BigInt(amount) }],
+  });
+
+  // Store metadata so /deposit/confirm can auto-credit the user's ledger
+  pendingDeposits.set(deposit.relayId, {
+    depositor: depositor.toLowerCase(),
+    token: token.toLowerCase(),
+    amount,
   });
 
   res.json({
@@ -274,7 +441,40 @@ app.post("/deposit/confirm", async (req: Request, res: Response) => {
   }
 
   await unlink.confirmDeposit(relayId);
-  res.json({ ok: true });
+
+  // Auto-credit user's internal ledger balance if we have deposit metadata
+  const pending = pendingDeposits.get(relayId);
+  let creditedBalance: string | undefined;
+
+  if (pending) {
+    pendingDeposits.delete(relayId);
+
+    const user = await prisma.user.findUnique({
+      where: { address: pending.depositor },
+    });
+
+    if (user) {
+      // Convert token-unit amount → 18-decimal USD (assuming 1:1 stablecoin)
+      // e.g. USDC 1000000 (6 dec) → 1000000000000000000 (18 dec)
+      const tokenDecimals = DEFAULT_TOKEN_DECIMALS;
+      const decimalDiff = 18 - tokenDecimals;
+      const usdAmount =
+        decimalDiff >= 0
+          ? BigInt(pending.amount) * 10n ** BigInt(decimalDiff)
+          : BigInt(pending.amount) / 10n ** BigInt(-decimalDiff);
+
+      creditedBalance = await creditBalance(
+        prisma,
+        user.id,
+        "usd",
+        usdAmount.toString(),
+        relayId,
+        `pool deposit via ${pending.token}`,
+      );
+    }
+  }
+
+  res.json({ ok: true, creditedBalance: creditedBalance ?? null });
 });
 
 // ─── POST /withdraw ───────────────────────────────────────────────────────────
@@ -303,7 +503,9 @@ app.post("/withdraw", async (req: Request, res: Response) => {
   }
 
   const result = await unlink.withdraw({
-    withdrawals: [{ token: token as `0x${string}`, amount: BigInt(amount), recipient: to }],
+    withdrawals: [
+      { token: token as `0x${string}`, amount: BigInt(amount), recipient: to },
+    ],
   });
 
   res.json({ relayId: result.relayId });
@@ -336,7 +538,7 @@ app.get("/events", async (req: Request, res: Response) => {
     events.map((e) => ({
       ...e,
       blockNumber: e.blockNumber.toString(),
-    }))
+    })),
   );
 });
 
@@ -468,65 +670,184 @@ app.delete("/contracts/:address", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// ─── GET /users/:addr/beneficiaries ──────────────────────────────────────────
+
+app.get("/users/:addr/beneficiaries", async (req: Request, res: Response) => {
+  const { addr } = req.params;
+
+  const user = await prisma.user.findUnique({
+    where: { address: addr.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const beneficiaries = await prisma.beneficiaryRegistry.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: "asc" },
+  });
+
+  res.json(beneficiaries);
+});
+
+// ─── POST /users/:addr/beneficiaries ─────────────────────────────────────────
+//
+// Body: { recipientHash: "0x...", address: "0x...", label?: "..." }
+
+app.post(
+  "/users/:addr/beneficiaries",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { addr } = req.params;
+    const { recipientHash, address, label } = req.body as {
+      recipientHash: string;
+      address: string;
+      label?: string;
+    };
+
+    if (!recipientHash || !address) {
+      res.status(400).json({ error: "recipientHash and address are required" });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { address: addr.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const beneficiary = await prisma.beneficiaryRegistry.upsert({
+      where: {
+        userId_recipientHash: {
+          userId: user.id,
+          recipientHash: recipientHash.toLowerCase(),
+        },
+      },
+      create: {
+        userId: user.id,
+        recipientHash: recipientHash.toLowerCase(),
+        address: address.toLowerCase(),
+        label,
+        status: "approved",
+      },
+      update: {
+        address: address.toLowerCase(),
+        label,
+        status: "approved",
+      },
+    });
+
+    res.status(201).json(beneficiary);
+  },
+);
+
+// ─── DELETE /users/:addr/beneficiaries/:hash ────────────────────────────────
+
+app.delete(
+  "/users/:addr/beneficiaries/:hash",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { addr, hash } = req.params;
+
+    const user = await prisma.user.findUnique({
+      where: { address: addr.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    await prisma.beneficiaryRegistry.delete({
+      where: {
+        userId_recipientHash: {
+          userId: user.id,
+          recipientHash: hash.toLowerCase(),
+        },
+      },
+    });
+
+    res.json({ ok: true });
+  },
+);
+
 // ─── POST /safe/propose ──────────────────────────────────────────────────────
 //
 // User submits a pre-signed Safe tx; bank validates guardrails, co-signs,
 // and executes on-chain (reaching the 2/2 threshold).
 
-app.post("/safe/propose", requirePrivyAuth, async (req: Request, res: Response) => {
-  const proposal = req.body as SafeTxProposal;
+app.post(
+  "/safe/propose",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const proposal = req.body as SafeTxProposal;
 
-  if (!proposal.safeAddress || !proposal.safeTx || !proposal.userSignature || !proposal.userAddress) {
-    res.status(400).json({ error: "safeAddress, safeTx, userSignature, and userAddress are required" });
-    return;
-  }
+    if (
+      !proposal.safeAddress ||
+      !proposal.safeTx ||
+      !proposal.userSignature ||
+      !proposal.userAddress
+    ) {
+      res.status(400).json({
+        error:
+          "safeAddress, safeTx, userSignature, and userAddress are required",
+      });
+      return;
+    }
 
-  if (!_adminAccount) {
-    res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
-    return;
-  }
+    if (!_adminAccount) {
+      res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+      return;
+    }
 
-  const result = await processProposal(
-    prisma,
-    _publicClient,
-    process.env.ADMIN_PRIVATE_KEY!,
-    RPC_URL,
-    proposal
-  );
+    const result = await processProposal(
+      prisma,
+      _publicClient,
+      process.env.ADMIN_PRIVATE_KEY!,
+      RPC_URL,
+      proposal,
+    );
 
-  if (result.approved) {
-    res.json(result);
-  } else {
-    res.status(403).json(result);
-  }
-});
+    if (result.approved) {
+      res.json(result);
+    } else {
+      res.status(403).json(result);
+    }
+  },
+);
 
 // ─── POST /policy/validate ───────────────────────────────────────────────────
 //
 // Pre-flight check: can this spend intent be auto-signed?
 
-app.post("/policy/validate", requirePrivyAuth, async (req: Request, res: Response) => {
-  const { userAddress, amount, recipientHash, transferType } = req.body as {
-    userAddress: string;
-    amount: string;
-    recipientHash?: string;
-    transferType?: number;
-  };
+app.post(
+  "/policy/validate",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { userAddress, amount, recipientHash, transferType } = req.body as {
+      userAddress: string;
+      amount: string;
+      recipientHash?: string;
+      transferType?: number;
+    };
 
-  if (!userAddress || !amount) {
-    res.status(400).json({ error: "userAddress and amount are required" });
-    return;
-  }
+    if (!userAddress || !amount) {
+      res.status(400).json({ error: "userAddress and amount are required" });
+      return;
+    }
 
-  const result = await validateSpendIntent(prisma, _publicClient, {
-    userAddress,
-    amount,
-    recipientHash,
-    transferType,
-  });
+    const result = await validateSpendIntent(prisma, _publicClient, {
+      userAddress,
+      amount,
+      recipientHash,
+      transferType,
+    });
 
-  res.json(result);
-});
+    res.json(result);
+  },
+);
 
 // ─── GET /pool/status ────────────────────────────────────────────────────────
 
@@ -549,31 +870,42 @@ app.get("/pool/status", async (_req: Request, res: Response) => {
 //
 // Record a deposit to the user's internal balance ledger.
 
-app.post("/users/:addr/deposit", requirePrivyAuth, async (req: Request, res: Response) => {
-  const { addr } = req.params;
-  const { token, amount, reference, note } = req.body as {
-    token: string;
-    amount: string;
-    reference?: string;
-    note?: string;
-  };
+app.post(
+  "/users/:addr/deposit",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { addr } = req.params;
+    const { token, amount, reference, note } = req.body as {
+      token: string;
+      amount: string;
+      reference?: string;
+      note?: string;
+    };
 
-  if (!token || !amount) {
-    res.status(400).json({ error: "token and amount are required" });
-    return;
-  }
+    if (!token || !amount) {
+      res.status(400).json({ error: "token and amount are required" });
+      return;
+    }
 
-  const user = await prisma.user.findUnique({
-    where: { address: addr.toLowerCase() },
-  });
-  if (!user) {
-    res.status(404).json({ error: "User not found" });
-    return;
-  }
+    const user = await prisma.user.findUnique({
+      where: { address: addr.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
 
-  const balance = await creditBalance(prisma, user.id, token, amount, reference, note);
-  res.status(201).json({ balance });
-});
+    const balance = await creditBalance(
+      prisma,
+      user.id,
+      token,
+      amount,
+      reference,
+      note,
+    );
+    res.status(201).json({ balance });
+  },
+);
 
 // ─── GET /users/:addr/balance ────────────────────────────────────────────────
 
@@ -661,7 +993,18 @@ app.post("/sub-accounts", async (req: Request, res: Response) => {
   }
 
   const account = await prisma.subAccount.create({
-    data: { name, operator, balance, deployed, dailyLimit, spentToday, status, protocols, pnl, perfData },
+    data: {
+      name,
+      operator,
+      balance,
+      deployed,
+      dailyLimit,
+      spentToday,
+      status,
+      protocols,
+      pnl,
+      perfData,
+    },
   });
 
   res.status(201).json(account);
@@ -692,6 +1035,66 @@ app.delete("/sub-accounts/:id", async (req: Request, res: Response) => {
   await prisma.subAccount.delete({ where: { id } });
   res.json({ ok: true });
 });
+
+// ─── GET /dead-letter ────────────────────────────────────────────────────────
+//
+// List events that failed all retries and were moved to dead letter queue.
+
+app.get("/dead-letter", async (req: Request, res: Response) => {
+  const limit = Math.min(Number(req.query.limit ?? 50), 200);
+
+  const events = await prisma.spendAuthorizedEvent.findMany({
+    where: { withdrawalStatus: "dead_letter" },
+    orderBy: { createdAt: "desc" },
+    take: limit,
+  });
+
+  res.json(
+    events.map((e) => ({
+      ...e,
+      blockNumber: e.blockNumber.toString(),
+    })),
+  );
+});
+
+// ─── POST /dead-letter/:id/retry ────────────────────────────────────────────
+//
+// Manually retry a dead-letter event by resetting it to pending.
+
+app.post(
+  "/dead-letter/:id/retry",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const id = Number(req.params.id);
+
+    const event = await prisma.spendAuthorizedEvent.findUnique({
+      where: { id },
+    });
+
+    if (!event) {
+      res.status(404).json({ error: "Event not found" });
+      return;
+    }
+
+    if (event.withdrawalStatus !== "dead_letter") {
+      res.status(400).json({ error: "Event is not in dead letter queue" });
+      return;
+    }
+
+    await prisma.spendAuthorizedEvent.update({
+      where: { id },
+      data: {
+        withdrawalStatus: "pending",
+        retryCount: 0,
+        nextRetryAt: null,
+        scheduledAt: new Date(),
+        withdrawalError: null,
+      },
+    });
+
+    res.json({ ok: true, id });
+  },
+);
 
 // ─── Error handler ────────────────────────────────────────────────────────────
 

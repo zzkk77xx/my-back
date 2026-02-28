@@ -3,34 +3,62 @@
  *
  * Each poll cycle:
  *   1. Fetches SpendAuthorized events from Envio indexer (with RPC fallback).
- *   2. Persists new events with withdrawalStatus = "pending".
- *   3. Processes all "pending" events:
+ *   2. Persists new events with withdrawalStatus = "pending" and a random
+ *      scheduledAt delay (timing decorrelation for privacy).
+ *   3. Processes eligible events (scheduledAt <= now):
  *        a. Resolves recipientHash → recipient address from RecipientMapping.
- *        b. Converts the 18-decimal USD amount to the token's native decimals.
- *        c. Calls unlink.withdraw() and stores the relayId.
- *        d. Marks the event "done" on success, "failed" on error,
+ *        b. Detects internal transfers (M2 → M2) and settles via ledger only.
+ *        c. Converts the 18-decimal USD amount to the token's native decimals.
+ *        d. Calls unlink.withdraw() and stores the relayId.
+ *        e. Marks the event "done" on success, "failed" on error,
  *           or "no_recipient" if no mapping is registered yet.
+ *   4. Retries failed events up to MAX_RETRIES with exponential backoff.
+ *      After max retries, moves to "dead_letter" status.
  *
  * Env vars:
  *   RPC_URL                   - HTTP JSON-RPC endpoint (required)
  *   ENVIO_GRAPHQL_URL         - Envio indexer GraphQL endpoint (optional, enables Envio mode)
  *   WATCHER_POLL_INTERVAL_MS  - Poll interval in ms (default: 10000)
  *   WATCHER_START_BLOCK       - Block to start from on first run (default: latest)
+ *   DECORRELATION_MIN_MS      - Min random delay before execution (default: 2000)
+ *   DECORRELATION_MAX_MS      - Max random delay before execution (default: 30000)
  */
 
 import { PrismaClient } from "@prisma/client";
 import type { Unlink } from "@unlink-xyz/node";
 import { createPublicClient, http, parseAbiItem, type Address } from "viem";
 import { AUDIT_ACTIONS, logAudit } from "./audit.js";
-import { debitBalance, InsufficientBalanceError } from "./ledger.js";
+import {
+  creditBalance,
+  debitBalance,
+  InsufficientBalanceError,
+} from "./ledger.js";
 
 const SPEND_AUTHORIZED = parseAbiItem(
-  "event SpendAuthorized(address indexed m2, address indexed eoa, uint256 amount, bytes32 recipientHash, uint8 transferType, uint256 nonce)"
+  "event SpendAuthorized(address indexed m2, address indexed eoa, uint256 amount, bytes32 recipientHash, uint8 transferType, uint256 nonce)",
 );
 
 const META_KEY = "last_processed_block";
 const POLL_INTERVAL = Number(process.env.WATCHER_POLL_INTERVAL_MS ?? 10_000);
 const ENVIO_GRAPHQL_URL = process.env.ENVIO_GRAPHQL_URL;
+
+// Retry logic
+const MAX_RETRIES = 3;
+const RETRY_BASE_MS = 30_000; // 30s base, doubles each retry
+
+// Timing decorrelation — random delay between auth event and execution
+const DECORRELATION_MIN_MS = Number(process.env.DECORRELATION_MIN_MS ?? 2_000);
+const DECORRELATION_MAX_MS = Number(process.env.DECORRELATION_MAX_MS ?? 30_000);
+
+// Exported for health check
+export let lastPollAt: Date | null = null;
+
+function randomDelay(): number {
+  return (
+    DECORRELATION_MIN_MS +
+    Math.random() * (DECORRELATION_MAX_MS - DECORRELATION_MIN_MS)
+  );
+}
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -45,27 +73,28 @@ export function startWatcher(prisma: PrismaClient, unlink: Unlink): void {
 
   if (ENVIO_GRAPHQL_URL) {
     console.log(
-      `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via Envio (${ENVIO_GRAPHQL_URL})`
+      `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via Envio (${ENVIO_GRAPHQL_URL})`,
     );
   } else {
     console.log(
-      `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via RPC (${rpcUrl})`
+      `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via RPC (${rpcUrl})`,
     );
     console.warn(
-      "[watcher] ENVIO_GRAPHQL_URL not set — using direct getLogs (may hit Monad block range limits)"
+      "[watcher] ENVIO_GRAPHQL_URL not set — using direct getLogs (may hit Monad block range limits)",
     );
   }
 
   const poll = async () => {
     try {
       await fetchAndPersistNewEvents(prisma, viemClient);
-      await processPendingWithdrawals(prisma, unlink);
+      await processEligibleEvents(prisma, unlink);
     } catch (err) {
       console.error(
         "[watcher] Poll error:",
-        err instanceof Error ? err.message : err
+        err instanceof Error ? err.message : err,
       );
     }
+    lastPollAt = new Date();
   };
 
   poll();
@@ -76,7 +105,7 @@ export function startWatcher(prisma: PrismaClient, unlink: Unlink): void {
 
 async function fetchAndPersistNewEvents(
   prisma: PrismaClient,
-  viemClient: ReturnType<typeof createPublicClient>
+  viemClient: ReturnType<typeof createPublicClient>,
 ) {
   const contracts = await prisma.watchedContract.findMany({
     select: { address: true },
@@ -87,7 +116,11 @@ async function fetchAndPersistNewEvents(
   if (ENVIO_GRAPHQL_URL) {
     await fetchViaEnvio(prisma, viemClient);
   } else {
-    await fetchViaRpc(prisma, viemClient, contracts.map((c) => c.address as Address));
+    await fetchViaRpc(
+      prisma,
+      viemClient,
+      contracts.map((c) => c.address as Address),
+    );
   }
 }
 
@@ -108,7 +141,7 @@ interface EnvioSpendAuthorized {
 
 async function fetchViaEnvio(
   prisma: PrismaClient,
-  viemClient: ReturnType<typeof createPublicClient>
+  viemClient: ReturnType<typeof createPublicClient>,
 ) {
   const latestBlock = await viemClient.getBlockNumber();
   const fromBlock = await resolveFromBlock(prisma, latestBlock);
@@ -164,14 +197,14 @@ async function fetchViaEnvio(
   } catch (err) {
     console.error(
       "[watcher] Envio query failed, skipping this cycle:",
-      err instanceof Error ? err.message : err
+      err instanceof Error ? err.message : err,
     );
     return;
   }
 
   if (events.length > 0) {
     console.log(
-      `[watcher] ${events.length} SpendAuthorized event(s) from Envio (blocks ${fromBlock}–${latestBlock})`
+      `[watcher] ${events.length} SpendAuthorized event(s) from Envio (blocks ${fromBlock}–${latestBlock})`,
     );
 
     await prisma.$transaction(
@@ -195,10 +228,11 @@ async function fetchViaEnvio(
             transferType: e.transferType,
             nonce: e.nonce,
             withdrawalStatus: "pending",
+            scheduledAt: new Date(Date.now() + randomDelay()),
           },
           update: {},
-        })
-      )
+        }),
+      ),
     );
   }
 
@@ -214,7 +248,7 @@ async function fetchViaEnvio(
 async function fetchViaRpc(
   prisma: PrismaClient,
   viemClient: ReturnType<typeof createPublicClient>,
-  addresses: Address[]
+  addresses: Address[],
 ) {
   const latestBlock = await viemClient.getBlockNumber();
   const fromBlock = await resolveFromBlock(prisma, latestBlock);
@@ -230,7 +264,7 @@ async function fetchViaRpc(
 
   if (logs.length > 0) {
     console.log(
-      `[watcher] ${logs.length} SpendAuthorized event(s) in blocks ${fromBlock}–${latestBlock}`
+      `[watcher] ${logs.length} SpendAuthorized event(s) in blocks ${fromBlock}–${latestBlock}`,
     );
 
     await prisma.$transaction(
@@ -254,10 +288,11 @@ async function fetchViaRpc(
             transferType: log.args.transferType!,
             nonce: log.args.nonce!.toString(),
             withdrawalStatus: "pending",
+            scheduledAt: new Date(Date.now() + randomDelay()),
           },
           update: {},
-        })
-      )
+        }),
+      ),
     );
   }
 
@@ -268,47 +303,72 @@ async function fetchViaRpc(
   });
 }
 
-// ─── Step 2: execute withdrawals for all pending events ───────────────────────
+// ─── Step 2: process eligible events (pending + retryable) ───────────────────
 
-async function processPendingWithdrawals(
-  prisma: PrismaClient,
-  unlink: Unlink
-) {
-  const pending = await prisma.spendAuthorizedEvent.findMany({
-    where: { withdrawalStatus: "pending" },
+async function processEligibleEvents(prisma: PrismaClient, unlink: Unlink) {
+  const now = new Date();
+
+  // Fetch pending events whose scheduledAt has passed + failed events eligible for retry
+  const events = await prisma.spendAuthorizedEvent.findMany({
+    where: {
+      OR: [
+        {
+          withdrawalStatus: "pending",
+          scheduledAt: { lte: now },
+        },
+        {
+          withdrawalStatus: "pending",
+          scheduledAt: null, // legacy events without scheduledAt
+        },
+        {
+          withdrawalStatus: "failed",
+          retryCount: { lt: MAX_RETRIES },
+          nextRetryAt: { lte: now },
+        },
+      ],
+    },
     orderBy: { nonce: "asc" },
   });
 
-  if (pending.length === 0) return;
+  if (events.length === 0) return;
 
   // Load contract configs (tokenAddress + tokenDecimals) and recipient mappings
   const [contracts, mappings] = await Promise.all([
     prisma.watchedContract.findMany(),
     prisma.recipientMapping.findMany({
-      where: { hash: { in: pending.map((e) => e.recipientHash) } },
+      where: { hash: { in: events.map((e) => e.recipientHash) } },
     }),
   ]);
 
   const contractByAddress = Object.fromEntries(
-    contracts.map((c) => [c.address.toLowerCase(), c])
+    contracts.map((c) => [c.address.toLowerCase(), c]),
   );
   const recipientByHash = Object.fromEntries(
-    mappings.map((m) => [m.hash.toLowerCase(), m.address])
+    mappings.map((m) => [m.hash.toLowerCase(), m.address]),
   );
 
-  for (const event of pending) {
+  for (const event of events) {
+    const isRetry = event.withdrawalStatus === "failed";
+
     // Mark as processing immediately to prevent concurrent re-runs
     await prisma.spendAuthorizedEvent.update({
       where: { id: event.id },
       data: { withdrawalStatus: "processing" },
     });
 
+    if (isRetry) {
+      await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_RETRY, null, {
+        eventId: event.id,
+        retryCount: event.retryCount + 1,
+      });
+    }
+
     const contract = contractByAddress[event.contractAddress.toLowerCase()];
     const recipient = recipientByHash[event.recipientHash.toLowerCase()];
 
     if (!recipient) {
       console.warn(
-        `[watcher] No recipient mapping for hash ${event.recipientHash} (event id=${event.id}) — skipping`
+        `[watcher] No recipient mapping for hash ${event.recipientHash} (event id=${event.id}) — skipping`,
       );
       await prisma.spendAuthorizedEvent.update({
         where: { id: event.id },
@@ -318,20 +378,92 @@ async function processPendingWithdrawals(
     }
 
     if (!contract) {
-      // Shouldn't happen, but guard anyway
-      await prisma.spendAuthorizedEvent.update({
-        where: { id: event.id },
-        data: {
-          withdrawalStatus: "failed",
-          withdrawalError: `Contract config not found for ${event.contractAddress}`,
-        },
-      });
+      await handleFailure(
+        prisma,
+        event,
+        `Contract config not found for ${event.contractAddress}`,
+      );
       continue;
     }
 
+    // ─── Internal transfer detection ─────────────────────────────────
+    // If the recipient is another M2 Safe within the bank, settle via
+    // ledger (debit sender, credit receiver) — no Unlink movement needed.
+    const recipientUser = await prisma.user.findFirst({
+      where: { safeAddress: recipient.toLowerCase() },
+    });
+
+    const senderUser = await prisma.user.findFirst({
+      where: { spendInteractorAddress: event.contractAddress.toLowerCase() },
+    });
+
+    if (recipientUser) {
+      console.log(
+        `[watcher] Internal transfer detected: event id=${event.id} → user ${recipientUser.id} (${recipientUser.safeAddress})`,
+      );
+
+      // Debit sender (best-effort)
+      if (senderUser) {
+        try {
+          await debitBalance(
+            prisma,
+            senderUser.id,
+            "usd",
+            event.amount,
+            `internal_transfer_event_${event.id}`,
+            `internal transfer to user ${recipientUser.id}`,
+          );
+        } catch (debitErr) {
+          if (debitErr instanceof InsufficientBalanceError) {
+            console.warn(
+              `[watcher] Insufficient ledger balance for sender user ${senderUser.id} — internal transfer still proceeding`,
+            );
+          } else {
+            console.error(
+              `[watcher] Ledger debit error for event id=${event.id}:`,
+              debitErr,
+            );
+          }
+        }
+      }
+
+      // Credit receiver
+      await creditBalance(
+        prisma,
+        recipientUser.id,
+        "usd",
+        event.amount,
+        `internal_transfer_event_${event.id}`,
+        `internal transfer from user ${senderUser?.id ?? "unknown"}`,
+      );
+
+      await prisma.spendAuthorizedEvent.update({
+        where: { id: event.id },
+        data: {
+          withdrawalStatus: "done",
+          withdrawalRelayId: "internal_transfer",
+        },
+      });
+
+      await logAudit(
+        prisma,
+        AUDIT_ACTIONS.INTERNAL_TRANSFER,
+        senderUser?.id ?? null,
+        {
+          eventId: event.id,
+          senderUserId: senderUser?.id,
+          recipientUserId: recipientUser.id,
+          amount: event.amount,
+          recipientSafe: recipientUser.safeAddress,
+        },
+      );
+
+      continue;
+    }
+
+    // ─── External withdrawal via Unlink ──────────────────────────────
     try {
       // Convert 18-decimal USD amount → token native decimals
-      // e.g. USDC (6 dec): amount / 10^(18-6) = amount / 10^12
       const usdAmount = BigInt(event.amount);
       const decimalDiff = 18 - contract.tokenDecimals;
       const tokenAmount =
@@ -341,7 +473,7 @@ async function processPendingWithdrawals(
 
       console.log(
         `[watcher] Withdrawing ${tokenAmount} (token units) of ${contract.tokenAddress} ` +
-          `→ ${recipient} for event id=${event.id}`
+          `→ ${recipient} for event id=${event.id}`,
       );
 
       const result = await unlink.withdraw({
@@ -363,63 +495,122 @@ async function processPendingWithdrawals(
       });
 
       console.log(
-        `[watcher] Withdrawal submitted for event id=${event.id} — relayId: ${result.relayId}`
+        `[watcher] Withdrawal submitted for event id=${event.id} — relayId: ${result.relayId}`,
       );
 
       // Debit user balance (best-effort — on-chain limits are the real backstop)
-      const user = await prisma.user.findFirst({
-        where: { spendInteractorAddress: event.contractAddress.toLowerCase() },
-      });
-      if (user) {
+      if (senderUser) {
         try {
           await debitBalance(
             prisma,
-            user.id,
+            senderUser.id,
             "usd",
             event.amount,
             result.relayId,
-            `withdrawal event id=${event.id}`
+            `withdrawal event id=${event.id}`,
           );
         } catch (debitErr) {
           if (debitErr instanceof InsufficientBalanceError) {
             console.warn(
-              `[watcher] Insufficient ledger balance for user ${user.id} — withdrawal still executed (on-chain limits are authoritative)`
+              `[watcher] Insufficient ledger balance for user ${senderUser.id} — withdrawal still executed (on-chain limits are authoritative)`,
             );
           } else {
             console.error(
               `[watcher] Ledger debit error for event id=${event.id}:`,
-              debitErr instanceof Error ? debitErr.message : debitErr
+              debitErr instanceof Error ? debitErr.message : debitErr,
             );
           }
         }
       }
 
-      await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_EXECUTED, user?.id ?? null, {
-        eventId: event.id,
-        contractAddress: event.contractAddress,
-        amount: event.amount,
-        recipient,
-        relayId: result.relayId,
-        tokenAddress: contract.tokenAddress,
-        tokenAmount: tokenAmount.toString(),
-      });
+      await logAudit(
+        prisma,
+        AUDIT_ACTIONS.WITHDRAWAL_EXECUTED,
+        senderUser?.id ?? null,
+        {
+          eventId: event.id,
+          contractAddress: event.contractAddress,
+          amount: event.amount,
+          recipient,
+          relayId: result.relayId,
+          tokenAddress: contract.tokenAddress,
+          tokenAmount: tokenAmount.toString(),
+        },
+      );
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(
-        `[watcher] Withdrawal failed for event id=${event.id}: ${message}`
+        `[watcher] Withdrawal failed for event id=${event.id}: ${message}`,
       );
-      await prisma.spendAuthorizedEvent.update({
-        where: { id: event.id },
-        data: { withdrawalStatus: "failed", withdrawalError: message },
-      });
-
-      await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_FAILED, null, {
-        eventId: event.id,
-        contractAddress: event.contractAddress,
-        amount: event.amount,
-        error: message,
-      });
+      await handleFailure(prisma, event, message);
     }
+  }
+}
+
+// ─── Retry / DLQ handling ────────────────────────────────────────────────────
+
+async function handleFailure(
+  prisma: PrismaClient,
+  event: {
+    id: number;
+    retryCount: number;
+    contractAddress: string;
+    amount: string;
+  },
+  errorMessage: string,
+) {
+  const newRetryCount = event.retryCount + 1;
+
+  if (newRetryCount >= MAX_RETRIES) {
+    // Move to dead letter queue
+    await prisma.spendAuthorizedEvent.update({
+      where: { id: event.id },
+      data: {
+        withdrawalStatus: "dead_letter",
+        withdrawalError: errorMessage,
+        retryCount: newRetryCount,
+      },
+    });
+
+    console.error(
+      `[watcher] Event id=${event.id} moved to dead letter queue after ${MAX_RETRIES} retries`,
+    );
+
+    await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_DLQ, null, {
+      eventId: event.id,
+      contractAddress: event.contractAddress,
+      amount: event.amount,
+      error: errorMessage,
+      retryCount: newRetryCount,
+    });
+  } else {
+    // Schedule retry with exponential backoff
+    const backoffMs = RETRY_BASE_MS * Math.pow(2, event.retryCount);
+    const nextRetryAt = new Date(Date.now() + backoffMs);
+
+    await prisma.spendAuthorizedEvent.update({
+      where: { id: event.id },
+      data: {
+        withdrawalStatus: "failed",
+        withdrawalError: errorMessage,
+        retryCount: newRetryCount,
+        nextRetryAt,
+      },
+    });
+
+    console.warn(
+      `[watcher] Event id=${event.id} failed (retry ${newRetryCount}/${MAX_RETRIES}), ` +
+        `next retry at ${nextRetryAt.toISOString()}`,
+    );
+
+    await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_FAILED, null, {
+      eventId: event.id,
+      contractAddress: event.contractAddress,
+      amount: event.amount,
+      error: errorMessage,
+      retryCount: newRetryCount,
+      nextRetryAt: nextRetryAt.toISOString(),
+    });
   }
 }
 
@@ -427,7 +618,7 @@ async function processPendingWithdrawals(
 
 async function resolveFromBlock(
   prisma: PrismaClient,
-  latestBlock: bigint
+  latestBlock: bigint,
 ): Promise<bigint> {
   const meta = await prisma.meta.findUnique({ where: { key: META_KEY } });
   if (meta) return BigInt(meta.value);
