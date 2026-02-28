@@ -1,0 +1,24 @@
+{
+  "name": "my-back",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "server": "tsx server.ts",
+    "withdraw": "tsx withdraw.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@unlink-xyz/node": "0.1.7-canary.7512856",
+    "express": "^5.2.1"
+  }
+}
