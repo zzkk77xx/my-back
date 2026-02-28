@@ -22,6 +22,11 @@ import express, { type Request, type Response } from "express";
 import { createPublicClient, createWalletClient, encodePacked, http, keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { requirePrivyAuth } from "./auth.js";
+import { processProposal, type SafeTxProposal } from "./auto-sign.js";
+import { queryAuditLogs } from "./audit.js";
+import { creditBalance, getAllBalances } from "./ledger.js";
+import { validateSpendIntent } from "./policy.js";
+import { getPoolStatus, startPoolMonitor } from "./pool.js";
 import { SPEND_INTERACTOR_ABI, deployUserSafe } from "./safe.js";
 import { startWatcher } from "./watcher.js";
 
@@ -463,6 +468,132 @@ app.delete("/contracts/:address", async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+// ─── POST /safe/propose ──────────────────────────────────────────────────────
+//
+// User submits a pre-signed Safe tx; bank validates guardrails, co-signs,
+// and executes on-chain (reaching the 2/2 threshold).
+
+app.post("/safe/propose", requirePrivyAuth, async (req: Request, res: Response) => {
+  const proposal = req.body as SafeTxProposal;
+
+  if (!proposal.safeAddress || !proposal.safeTx || !proposal.userSignature || !proposal.userAddress) {
+    res.status(400).json({ error: "safeAddress, safeTx, userSignature, and userAddress are required" });
+    return;
+  }
+
+  if (!_adminAccount) {
+    res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+    return;
+  }
+
+  const result = await processProposal(
+    prisma,
+    _publicClient,
+    process.env.ADMIN_PRIVATE_KEY!,
+    RPC_URL,
+    proposal
+  );
+
+  if (result.approved) {
+    res.json(result);
+  } else {
+    res.status(403).json(result);
+  }
+});
+
+// ─── POST /policy/validate ───────────────────────────────────────────────────
+//
+// Pre-flight check: can this spend intent be auto-signed?
+
+app.post("/policy/validate", requirePrivyAuth, async (req: Request, res: Response) => {
+  const { userAddress, amount, recipientHash, transferType } = req.body as {
+    userAddress: string;
+    amount: string;
+    recipientHash?: string;
+    transferType?: number;
+  };
+
+  if (!userAddress || !amount) {
+    res.status(400).json({ error: "userAddress and amount are required" });
+    return;
+  }
+
+  const result = await validateSpendIntent(prisma, _publicClient, {
+    userAddress,
+    amount,
+    recipientHash,
+    transferType,
+  });
+
+  res.json(result);
+});
+
+// ─── GET /pool/status ────────────────────────────────────────────────────────
+
+app.get("/pool/status", async (_req: Request, res: Response) => {
+  const status = await getPoolStatus(unlink);
+  res.json(status);
+});
+
+// ─── POST /users/:addr/deposit ───────────────────────────────────────────────
+//
+// Record a deposit to the user's internal balance ledger.
+
+app.post("/users/:addr/deposit", requirePrivyAuth, async (req: Request, res: Response) => {
+  const { addr } = req.params;
+  const { token, amount, reference, note } = req.body as {
+    token: string;
+    amount: string;
+    reference?: string;
+    note?: string;
+  };
+
+  if (!token || !amount) {
+    res.status(400).json({ error: "token and amount are required" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { address: addr.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const balance = await creditBalance(prisma, user.id, token, amount, reference, note);
+  res.status(201).json({ balance });
+});
+
+// ─── GET /users/:addr/balance ────────────────────────────────────────────────
+
+app.get("/users/:addr/balance", async (req: Request, res: Response) => {
+  const { addr } = req.params;
+
+  const user = await prisma.user.findUnique({
+    where: { address: addr.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const balances = await getAllBalances(prisma, user.id);
+  res.json({ balances });
+});
+
+// ─── GET /audit ──────────────────────────────────────────────────────────────
+
+app.get("/audit", requirePrivyAuth, async (req: Request, res: Response) => {
+  const action = req.query.action as string | undefined;
+  const userId = req.query.userId ? Number(req.query.userId) : undefined;
+  const limit = req.query.limit ? Number(req.query.limit) : undefined;
+  const offset = req.query.offset ? Number(req.query.offset) : undefined;
+
+  const logs = await queryAuditLogs(prisma, { action, userId, limit, offset });
+  res.json(logs);
+});
+
 // ─── Error handler ────────────────────────────────────────────────────────────
 
 app.use((err: unknown, _req: Request, res: Response) => {
@@ -475,6 +606,7 @@ app.use((err: unknown, _req: Request, res: Response) => {
 
 await initWallet();
 startWatcher(prisma, unlink);
+startPoolMonitor(prisma, unlink);
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });

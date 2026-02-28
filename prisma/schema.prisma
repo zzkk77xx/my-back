@@ -74,3 +74,42 @@ model Meta {
 
   @@map("meta")
 }
+
+// Per-user deposited balance (what they can spend)
+model UserBalance {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  token     String   @db.VarChar(42) // "usd" for USD-denominated, or token address
+  balance   String                    // decimal string, 18 decimals
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, token])
+  @@map("user_balances")
+}
+
+// Immutable ledger of all balance mutations
+model BalanceLedger {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  token     String   @db.VarChar(42)
+  type      String   // "deposit" | "spend" | "refund"
+  amount    String   // decimal string, 18 decimals
+  reference String?  // txHash or relayId
+  note      String?
+  createdAt DateTime @default(now())
+
+  @@map("balance_ledger")
+}
+
+// Compliance audit trail for all auto-sign / pool / withdrawal decisions
+model AuditLog {
+  id        Int      @id @default(autoincrement())
+  action    String   // auto_sign_approved | auto_sign_rejected | withdrawal_executed | withdrawal_failed | deposit_recorded | pool_topup | pool_topup_failed
+  userId    Int?
+  details   String   // JSON blob
+  createdAt DateTime @default(now())
+
+  @@index([action])
+  @@index([userId])
+  @@map("audit_logs")
+}

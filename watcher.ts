@@ -21,6 +21,8 @@
 import { PrismaClient } from "@prisma/client";
 import type { Unlink } from "@unlink-xyz/node";
 import { createPublicClient, http, parseAbiItem, type Address } from "viem";
+import { AUDIT_ACTIONS, logAudit } from "./audit.js";
+import { debitBalance, InsufficientBalanceError } from "./ledger.js";
 
 const SPEND_AUTHORIZED = parseAbiItem(
   "event SpendAuthorized(address indexed m2, address indexed eoa, uint256 amount, bytes32 recipientHash, uint8 transferType, uint256 nonce)"
@@ -363,6 +365,44 @@ async function processPendingWithdrawals(
       console.log(
         `[watcher] Withdrawal submitted for event id=${event.id} — relayId: ${result.relayId}`
       );
+
+      // Debit user balance (best-effort — on-chain limits are the real backstop)
+      const user = await prisma.user.findFirst({
+        where: { spendInteractorAddress: event.contractAddress.toLowerCase() },
+      });
+      if (user) {
+        try {
+          await debitBalance(
+            prisma,
+            user.id,
+            "usd",
+            event.amount,
+            result.relayId,
+            `withdrawal event id=${event.id}`
+          );
+        } catch (debitErr) {
+          if (debitErr instanceof InsufficientBalanceError) {
+            console.warn(
+              `[watcher] Insufficient ledger balance for user ${user.id} — withdrawal still executed (on-chain limits are authoritative)`
+            );
+          } else {
+            console.error(
+              `[watcher] Ledger debit error for event id=${event.id}:`,
+              debitErr instanceof Error ? debitErr.message : debitErr
+            );
+          }
+        }
+      }
+
+      await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_EXECUTED, user?.id ?? null, {
+        eventId: event.id,
+        contractAddress: event.contractAddress,
+        amount: event.amount,
+        recipient,
+        relayId: result.relayId,
+        tokenAddress: contract.tokenAddress,
+        tokenAmount: tokenAmount.toString(),
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(
@@ -371,6 +411,13 @@ async function processPendingWithdrawals(
       await prisma.spendAuthorizedEvent.update({
         where: { id: event.id },
         data: { withdrawalStatus: "failed", withdrawalError: message },
+      });
+
+      await logAudit(prisma, AUDIT_ACTIONS.WITHDRAWAL_FAILED, null, {
+        eventId: event.id,
+        contractAddress: event.contractAddress,
+        amount: event.amount,
+        error: message,
       });
     }
   }
