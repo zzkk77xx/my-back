@@ -5,10 +5,10 @@ generator client {
 datasource db {
   provider     = "postgresql"
   url          = env("DATABASE_URL")
-  relationMode = "prisma" // PlanetScale: no FK enforcement
+  relationMode = "prisma"
 }
 
-// Persisted SpendAuthorized on-chain events
+// Persisted SpendAuthorized on-chain events + withdrawal execution state
 model SpendAuthorizedEvent {
   id              Int      @id @default(autoincrement())
   blockNumber     BigInt
@@ -17,26 +17,46 @@ model SpendAuthorizedEvent {
   contractAddress String   @db.VarChar(42)
   m2              String   @db.VarChar(42)
   eoa             String   @db.VarChar(42)
-  amount          String // uint256 stored as decimal string
+  amount          String   // uint256 (18-decimal USD) as decimal string
   recipientHash   String   @db.VarChar(66)
   transferType    Int
-  nonce           String // uint256 stored as decimal string
+  nonce           String   // uint256 as decimal string
   createdAt       DateTime @default(now())
+
+  // Withdrawal execution tracking
+  // Status: "pending" | "processing" | "done" | "failed" | "no_recipient"
+  withdrawalStatus  String  @default("pending")
+  withdrawalRelayId String? // relayId from Unlink once submitted
+  withdrawalError   String? // error message if status = "failed"
 
   @@unique([txHash, logIndex])
   @@map("spend_authorized_events")
 }
 
-// Contract addresses the event watcher monitors
+// Contract addresses the event watcher monitors.
+// Each contract maps to a specific ERC-20 token in the Unlink pool.
 model WatchedContract {
-  address   String   @id @db.VarChar(42)
-  label     String?
-  createdAt DateTime @default(now())
+  address      String  @id @db.VarChar(42)
+  label        String?
+  tokenAddress String  @db.VarChar(42) // ERC-20 token for Unlink withdrawal
+  tokenDecimals Int    @default(6)     // decimals for amount conversion (USDC = 6)
+  createdAt    DateTime @default(now())
 
   @@map("watched_contracts")
 }
 
-// Generic key-value store for watcher state (e.g. last processed block)
+// Maps on-chain recipientHash (bytes32) → actual withdrawal recipient address.
+// The hash is computed off-chain before calling authorizeSpend().
+model RecipientMapping {
+  hash      String   @id @db.VarChar(66) // keccak256 hex (0x-prefixed)
+  address   String   @db.VarChar(42)     // 0x-prefixed EOA recipient
+  label     String?
+  createdAt DateTime @default(now())
+
+  @@map("recipient_mappings")
+}
+
+// Watcher state (last processed block, etc.)
 model Meta {
   key   String @id
   value String

@@ -8,7 +8,7 @@
  * Env vars:
  *   UNLINK_MNEMONIC           - 24-word BIP-39 mnemonic (required)
  *   SAFE_ADDRESS              - Default withdrawal recipient (0x-prefixed)
- *   DATABASE_URL              - PlanetScale MySQL connection string (required)
+ *   DATABASE_URL              - PostgreSQL connection string (required)
  *   RPC_URL                   - Monad testnet HTTP RPC for event watching
  *   PORT                      - HTTP port (default: 3000)
  *   WATCHER_POLL_INTERVAL_MS  - Event poll interval in ms (default: 10000)
@@ -189,23 +189,84 @@ app.get("/contracts", async (_req: Request, res: Response) => {
 
 // ─── POST /contracts ──────────────────────────────────────────────────────────
 //
-// Body: { address: "0x...", label?: "..." }
+// Body: { address: "0x...", tokenAddress: "0x...", tokenDecimals?: 6, label?: "..." }
 
 app.post("/contracts", async (req: Request, res: Response) => {
-  const { address, label } = req.body as { address: string; label?: string };
+  const { address, tokenAddress, tokenDecimals, label } = req.body as {
+    address: string;
+    tokenAddress: string;
+    tokenDecimals?: number;
+    label?: string;
+  };
 
-  if (!address) {
-    res.status(400).json({ error: "address is required" });
+  if (!address || !tokenAddress) {
+    res.status(400).json({ error: "address and tokenAddress are required" });
     return;
   }
 
   const contract = await prisma.watchedContract.upsert({
     where: { address: address.toLowerCase() },
-    create: { address: address.toLowerCase(), label },
-    update: { label },
+    create: {
+      address: address.toLowerCase(),
+      tokenAddress: tokenAddress.toLowerCase(),
+      tokenDecimals: tokenDecimals ?? 6,
+      label,
+    },
+    update: {
+      tokenAddress: tokenAddress.toLowerCase(),
+      tokenDecimals: tokenDecimals ?? 6,
+      label,
+    },
   });
 
   res.status(201).json(contract);
+});
+
+// ─── GET /recipients ──────────────────────────────────────────────────────────
+
+app.get("/recipients", async (_req: Request, res: Response) => {
+  const mappings = await prisma.recipientMapping.findMany({
+    orderBy: { createdAt: "asc" },
+  });
+  res.json(mappings);
+});
+
+// ─── POST /recipients ─────────────────────────────────────────────────────────
+//
+// Body: { hash: "0x...", address: "0x...", label?: "..." }
+// hash = keccak256 of the recipient identifier, as passed to authorizeSpend()
+
+app.post("/recipients", async (req: Request, res: Response) => {
+  const { hash, address, label } = req.body as {
+    hash: string;
+    address: string;
+    label?: string;
+  };
+
+  if (!hash || !address) {
+    res.status(400).json({ error: "hash and address are required" });
+    return;
+  }
+
+  const mapping = await prisma.recipientMapping.upsert({
+    where: { hash: hash.toLowerCase() },
+    create: { hash: hash.toLowerCase(), address: address.toLowerCase(), label },
+    update: { address: address.toLowerCase(), label },
+  });
+
+  res.status(201).json(mapping);
+});
+
+// ─── DELETE /recipients/:hash ─────────────────────────────────────────────────
+
+app.delete("/recipients/:hash", async (req: Request, res: Response) => {
+  const { hash } = req.params;
+
+  await prisma.recipientMapping.delete({
+    where: { hash: hash.toLowerCase() },
+  });
+
+  res.json({ ok: true });
 });
 
 // ─── DELETE /contracts/:address ───────────────────────────────────────────────
@@ -231,7 +292,7 @@ app.use((err: unknown, _req: Request, res: Response) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 await initWallet();
-startWatcher(prisma);
+startWatcher(prisma, unlink);
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });
