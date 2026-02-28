@@ -23,10 +23,15 @@ declare global {
 
 const PRIVY_APP_ID = process.env.PRIVY_APP_ID;
 const PRIVY_APP_SECRET = process.env.PRIVY_APP_SECRET;
+const TEST_AUTH_BYPASS = process.env.TEST_AUTH_BYPASS === "true";
 
-if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+if (TEST_AUTH_BYPASS) {
   console.warn(
-    "[auth] PRIVY_APP_ID or PRIVY_APP_SECRET not set — requirePrivyAuth middleware will reject all requests"
+    "[auth] TEST_AUTH_BYPASS enabled — accepting X-Test-User-Id header instead of Privy tokens. DO NOT use in production!",
+  );
+} else if (!PRIVY_APP_ID || !PRIVY_APP_SECRET) {
+  console.warn(
+    "[auth] PRIVY_APP_ID or PRIVY_APP_SECRET not set — requirePrivyAuth middleware will reject all requests",
   );
 }
 
@@ -43,8 +48,18 @@ const privy =
 export async function requirePrivyAuth(
   req: Request,
   res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> {
+  // Test bypass: accept X-Test-User-Id header when TEST_AUTH_BYPASS=true
+  if (TEST_AUTH_BYPASS) {
+    const testUserId = req.headers["x-test-user-id"] as string | undefined;
+    if (testUserId) {
+      req.privyUserId = testUserId;
+      next();
+      return;
+    }
+  }
+
   const authHeader = req.headers.authorization;
   const token = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : null;
 
@@ -54,7 +69,9 @@ export async function requirePrivyAuth(
   }
 
   if (!privy) {
-    res.status(500).json({ error: "Auth not configured (PRIVY_APP_ID / PRIVY_APP_SECRET missing)" });
+    res.status(500).json({
+      error: "Auth not configured (PRIVY_APP_ID / PRIVY_APP_SECRET missing)",
+    });
     return;
   }
 
