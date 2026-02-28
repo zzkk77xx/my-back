@@ -2,7 +2,7 @@
  * SpendAuthorized event watcher + withdrawal executor.
  *
  * Each poll cycle:
- *   1. Fetches SpendAuthorized logs from watched contracts.
+ *   1. Fetches SpendAuthorized events from Envio indexer (with RPC fallback).
  *   2. Persists new events with withdrawalStatus = "pending".
  *   3. Processes all "pending" events:
  *        a. Resolves recipientHash → recipient address from RecipientMapping.
@@ -13,6 +13,7 @@
  *
  * Env vars:
  *   RPC_URL                   - HTTP JSON-RPC endpoint (required)
+ *   ENVIO_GRAPHQL_URL         - Envio indexer GraphQL endpoint (optional, enables Envio mode)
  *   WATCHER_POLL_INTERVAL_MS  - Poll interval in ms (default: 10000)
  *   WATCHER_START_BLOCK       - Block to start from on first run (default: latest)
  */
@@ -27,6 +28,7 @@ const SPEND_AUTHORIZED = parseAbiItem(
 
 const META_KEY = "last_processed_block";
 const POLL_INTERVAL = Number(process.env.WATCHER_POLL_INTERVAL_MS ?? 10_000);
+const ENVIO_GRAPHQL_URL = process.env.ENVIO_GRAPHQL_URL;
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -39,9 +41,18 @@ export function startWatcher(prisma: PrismaClient, unlink: Unlink): void {
 
   const viemClient = createPublicClient({ transport: http(rpcUrl) });
 
-  console.log(
-    `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via ${rpcUrl}`
-  );
+  if (ENVIO_GRAPHQL_URL) {
+    console.log(
+      `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via Envio (${ENVIO_GRAPHQL_URL})`
+    );
+  } else {
+    console.log(
+      `[watcher] Starting — polling every ${POLL_INTERVAL / 1000}s via RPC (${rpcUrl})`
+    );
+    console.warn(
+      "[watcher] ENVIO_GRAPHQL_URL not set — using direct getLogs (may hit Monad block range limits)"
+    );
+  }
 
   const poll = async () => {
     try {
@@ -59,7 +70,7 @@ export function startWatcher(prisma: PrismaClient, unlink: Unlink): void {
   setInterval(poll, POLL_INTERVAL);
 }
 
-// ─── Step 1: fetch on-chain logs and persist new events ──────────────────────
+// ─── Step 1: fetch events and persist ────────────────────────────────────────
 
 async function fetchAndPersistNewEvents(
   prisma: PrismaClient,
@@ -71,7 +82,136 @@ async function fetchAndPersistNewEvents(
 
   if (contracts.length === 0) return;
 
-  const addresses = contracts.map((c) => c.address as Address);
+  if (ENVIO_GRAPHQL_URL) {
+    await fetchViaEnvio(prisma, viemClient);
+  } else {
+    await fetchViaRpc(prisma, viemClient, contracts.map((c) => c.address as Address));
+  }
+}
+
+// ─── Envio GraphQL source ────────────────────────────────────────────────────
+
+interface EnvioSpendAuthorized {
+  m2: string;
+  eoa: string;
+  amount: string;
+  recipientHash: string;
+  transferType: number;
+  nonce: string;
+  blockNumber: string;
+  txHash: string;
+  logIndex: number;
+}
+
+async function fetchViaEnvio(
+  prisma: PrismaClient,
+  viemClient: ReturnType<typeof createPublicClient>
+) {
+  const latestBlock = await viemClient.getBlockNumber();
+  const fromBlock = await resolveFromBlock(prisma, latestBlock);
+
+  if (fromBlock > latestBlock) return;
+
+  const query = `
+    query SpendAuthorizedEvents($sinceBlock: numeric!) {
+      SpendAuthorized(
+        where: { blockNumber: { _gt: $sinceBlock } }
+        order_by: { blockNumber: asc, logIndex: asc }
+      ) {
+        m2
+        eoa
+        amount
+        recipientHash
+        transferType
+        nonce
+        blockNumber
+        txHash
+        logIndex
+      }
+    }
+  `;
+
+  let events: EnvioSpendAuthorized[];
+
+  try {
+    const res = await fetch(ENVIO_GRAPHQL_URL!, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query,
+        variables: { sinceBlock: (fromBlock - 1n).toString() },
+      }),
+    });
+
+    if (!res.ok) {
+      throw new Error(`Envio HTTP ${res.status}: ${await res.text()}`);
+    }
+
+    const json = (await res.json()) as {
+      data?: { SpendAuthorized: EnvioSpendAuthorized[] };
+      errors?: Array<{ message: string }>;
+    };
+
+    if (json.errors?.length) {
+      throw new Error(`Envio GraphQL: ${json.errors[0].message}`);
+    }
+
+    events = json.data?.SpendAuthorized ?? [];
+  } catch (err) {
+    console.error(
+      "[watcher] Envio query failed, skipping this cycle:",
+      err instanceof Error ? err.message : err
+    );
+    return;
+  }
+
+  if (events.length > 0) {
+    console.log(
+      `[watcher] ${events.length} SpendAuthorized event(s) from Envio (blocks ${fromBlock}–${latestBlock})`
+    );
+
+    await prisma.$transaction(
+      events.map((e) =>
+        prisma.spendAuthorizedEvent.upsert({
+          where: {
+            txHash_logIndex: {
+              txHash: e.txHash,
+              logIndex: e.logIndex,
+            },
+          },
+          create: {
+            blockNumber: BigInt(e.blockNumber),
+            txHash: e.txHash,
+            logIndex: e.logIndex,
+            contractAddress: e.m2.toLowerCase(), // m2 is the SpendInteractor address
+            m2: e.m2.toLowerCase(),
+            eoa: e.eoa.toLowerCase(),
+            amount: e.amount,
+            recipientHash: e.recipientHash,
+            transferType: e.transferType,
+            nonce: e.nonce,
+            withdrawalStatus: "pending",
+          },
+          update: {},
+        })
+      )
+    );
+  }
+
+  await prisma.meta.upsert({
+    where: { key: META_KEY },
+    create: { key: META_KEY, value: (latestBlock + 1n).toString() },
+    update: { value: (latestBlock + 1n).toString() },
+  });
+}
+
+// ─── RPC getLogs fallback ────────────────────────────────────────────────────
+
+async function fetchViaRpc(
+  prisma: PrismaClient,
+  viemClient: ReturnType<typeof createPublicClient>,
+  addresses: Address[]
+) {
   const latestBlock = await viemClient.getBlockNumber();
   const fromBlock = await resolveFromBlock(prisma, latestBlock);
 
@@ -89,7 +229,6 @@ async function fetchAndPersistNewEvents(
       `[watcher] ${logs.length} SpendAuthorized event(s) in blocks ${fromBlock}–${latestBlock}`
     );
 
-    // Persist new events (upsert = idempotent; update:{} = no-op if already exists)
     await prisma.$transaction(
       logs.map((log) =>
         prisma.spendAuthorizedEvent.upsert({
@@ -112,13 +251,12 @@ async function fetchAndPersistNewEvents(
             nonce: log.args.nonce!.toString(),
             withdrawalStatus: "pending",
           },
-          update: {}, // no-op — already stored, don't overwrite withdrawal state
+          update: {},
         })
       )
     );
   }
 
-  // Advance cursor to next block
   await prisma.meta.upsert({
     where: { key: META_KEY },
     create: { key: META_KEY, value: (latestBlock + 1n).toString() },
