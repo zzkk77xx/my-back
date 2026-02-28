@@ -1,0 +1,45 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider     = "postgresql"
+  url          = env("DATABASE_URL")
+  relationMode = "prisma" // PlanetScale: no FK enforcement
+}
+
+// Persisted SpendAuthorized on-chain events
+model SpendAuthorizedEvent {
+  id              Int      @id @default(autoincrement())
+  blockNumber     BigInt
+  txHash          String   @db.VarChar(66)
+  logIndex        Int
+  contractAddress String   @db.VarChar(42)
+  m2              String   @db.VarChar(42)
+  eoa             String   @db.VarChar(42)
+  amount          String // uint256 stored as decimal string
+  recipientHash   String   @db.VarChar(66)
+  transferType    Int
+  nonce           String // uint256 stored as decimal string
+  createdAt       DateTime @default(now())
+
+  @@unique([txHash, logIndex])
+  @@map("spend_authorized_events")
+}
+
+// Contract addresses the event watcher monitors
+model WatchedContract {
+  address   String   @id @db.VarChar(42)
+  label     String?
+  createdAt DateTime @default(now())
+
+  @@map("watched_contracts")
+}
+
+// Generic key-value store for watcher state (e.g. last processed block)
+model Meta {
+  key   String @id
+  value String
+
+  @@map("meta")
+}

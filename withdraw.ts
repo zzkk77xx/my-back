@@ -1,23 +1,21 @@
 /**
  * Withdraw from an Unlink private account to a Safe multisig address.
+ * Wallet state is derived from UNLINK_MNEMONIC on every run (in-memory).
  *
  * Required env vars:
- *   SAFE_ADDRESS    - 0x-prefixed address of the destination Safe
- *   TOKEN_ADDRESS   - 0x-prefixed ERC-20 token contract address
- *   AMOUNT          - Amount to withdraw in the token's smallest unit (bigint string, e.g. "1000000")
- *
- * Optional:
- *   DB_PATH         - SQLite file path (default: ./data/wallet.db)
+ *   UNLINK_MNEMONIC  - 24-word BIP-39 mnemonic
+ *   SAFE_ADDRESS     - 0x-prefixed destination Safe address
+ *   TOKEN_ADDRESS    - 0x-prefixed ERC-20 token contract address
+ *   AMOUNT           - Amount in the token's smallest unit (e.g. "1000000")
  */
 
 import {
-  createSqliteStorage,
   initUnlink,
   TransactionFailedError,
   waitForConfirmation,
 } from "@unlink-xyz/node";
 
-// ─── Config ──────────────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 function requireEnv(name: string): string {
   const value = process.env[name];
@@ -25,26 +23,29 @@ function requireEnv(name: string): string {
   return value;
 }
 
+const MNEMONIC = requireEnv("UNLINK_MNEMONIC");
 const SAFE_ADDRESS = requireEnv("SAFE_ADDRESS") as `0x${string}`;
 const TOKEN_ADDRESS = requireEnv("TOKEN_ADDRESS") as `0x${string}`;
 const AMOUNT = BigInt(requireEnv("AMOUNT"));
-const DB_PATH = process.env.DB_PATH ?? "./data/wallet.db";
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 async function main() {
-  console.log("Initializing Unlink wallet...");
+  console.log("Initializing Unlink wallet from mnemonic...");
 
   const unlink = await initUnlink({
     chain: "monad-testnet",
-    storage: createSqliteStorage({ path: DB_PATH }),
+    setup: false,
+    sync: false,
   });
 
-  // Log the active private account address so you can look it up or fund it
-  const account = await unlink.accounts.getActive();
-  console.log("Active Unlink account:", account.address);
+  await unlink.seed.importMnemonic(MNEMONIC);
+  await unlink.accounts.create();
+  await unlink.sync();
 
-  // Current private balance for the token
+  const account = await unlink.accounts.getActive();
+  console.log("Active Unlink account:", account!.address);
+
   const balance = await unlink.getBalance(TOKEN_ADDRESS);
   console.log(`Private balance: ${balance} (raw units)`);
 
@@ -60,11 +61,7 @@ async function main() {
 
   const result = await unlink.withdraw({
     withdrawals: [
-      {
-        token: TOKEN_ADDRESS,
-        amount: AMOUNT,
-        recipient: SAFE_ADDRESS,
-      },
+      { token: TOKEN_ADDRESS, amount: AMOUNT, recipient: SAFE_ADDRESS },
     ],
   });
 
@@ -73,7 +70,7 @@ async function main() {
 
   const status = await waitForConfirmation(unlink, result.relayId);
 
-  console.log("✔ Withdrawal confirmed!");
+  console.log("Withdrawal confirmed!");
   console.log("  Tx hash :", status.txHash);
   console.log("  State   :", status.state);
 }
