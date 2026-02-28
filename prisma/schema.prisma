@@ -56,6 +56,16 @@ model RecipientMapping {
   @@map("recipient_mappings")
 }
 
+// Registered users and their deployed 2/2 Safe addresses
+model User {
+  id          Int      @id @default(autoincrement())
+  address     String   @unique @db.VarChar(42) // user EOA
+  safeAddress String   @db.VarChar(42)         // deployed 2/2 Safe
+  createdAt   DateTime @default(now())
+
+  @@map("users")
+}
+
 // Watcher state (last processed block, etc.)
 model Meta {
   key   String @id

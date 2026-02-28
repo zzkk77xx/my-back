@@ -18,6 +18,7 @@
 import { PrismaClient } from "@prisma/client";
 import { initUnlink, type Unlink } from "@unlink-xyz/node";
 import express, { type Request, type Response } from "express";
+import { deployUserSafe } from "./safe.js";
 import { startWatcher } from "./watcher.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -50,6 +51,37 @@ async function initWallet() {
 
 const app = express();
 app.use(express.json());
+
+// ─── POST /users/register ─────────────────────────────────────────────────────
+//
+// Body: { address: "0x..." }
+// Idempotent: returns the existing Safe address if the user is already registered.
+
+app.post("/users/register", async (req: Request, res: Response) => {
+  const { address } = req.body as { address: string };
+
+  if (!address) {
+    res.status(400).json({ error: "address is required" });
+    return;
+  }
+
+  const normalized = address.toLowerCase();
+
+  // Return early if already registered
+  const existing = await prisma.user.findUnique({ where: { address: normalized } });
+  if (existing) {
+    res.json({ safeAddress: existing.safeAddress, created: false });
+    return;
+  }
+
+  const { safeAddress } = await deployUserSafe(address);
+
+  const user = await prisma.user.create({
+    data: { address: normalized, safeAddress: safeAddress.toLowerCase() },
+  });
+
+  res.status(201).json({ safeAddress: user.safeAddress, created: true });
+});
 
 // ─── GET /account ─────────────────────────────────────────────────────────────
 
