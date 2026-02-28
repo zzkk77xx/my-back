@@ -29,7 +29,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { requirePrivyAuth } from "./auth.js";
 import { processProposal, type SafeTxProposal } from "./auto-sign.js";
-import { queryAuditLogs } from "./audit.js";
+import { AUDIT_ACTIONS, logAudit, queryAuditLogs } from "./audit.js";
 import { creditBalance, getAllBalances } from "./ledger.js";
 import { validateSpendIntent } from "./policy.js";
 import { getPoolStatus, startPoolMonitor } from "./pool.js";
@@ -474,7 +474,57 @@ app.post("/deposit/confirm", async (req: Request, res: Response) => {
     }
   }
 
-  res.json({ ok: true, creditedBalance: creditedBalance ?? null });
+  // 90/10 split: sweep 90% of deposit to M1 Safe, keep 10% in Unlink as liquidity
+  let sweepRelayId: string | undefined;
+  if (pending && DEFAULT_RECIPIENT) {
+    const depositTokenAmount = BigInt(pending.amount);
+    const sweepAmount = (depositTokenAmount * 90n) / 100n;
+
+    if (sweepAmount > 0n) {
+      try {
+        const sweepResult = await unlink.withdraw({
+          withdrawals: [
+            {
+              token: pending.token as `0x${string}`,
+              amount: sweepAmount,
+              recipient: DEFAULT_RECIPIENT,
+            },
+          ],
+        });
+        sweepRelayId = sweepResult.relayId;
+
+        console.log(
+          `[deposit] Swept 90% (${sweepAmount}) to M1 Safe ${DEFAULT_RECIPIENT}, relay: ${sweepRelayId}`,
+        );
+
+        await logAudit(prisma, AUDIT_ACTIONS.POOL_SWEEP, null, {
+          trigger: "deposit_90_10_split",
+          tokenAddress: pending.token,
+          depositAmount: pending.amount,
+          sweepAmount: sweepAmount.toString(),
+          retainedAmount: (depositTokenAmount - sweepAmount).toString(),
+          recipient: DEFAULT_RECIPIENT,
+          relayId: sweepRelayId,
+          depositor: pending.depositor,
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[deposit] 90/10 sweep failed: ${msg}`);
+        await logAudit(prisma, AUDIT_ACTIONS.POOL_SWEEP_FAILED, null, {
+          trigger: "deposit_90_10_split",
+          error: msg,
+          tokenAddress: pending.token,
+          depositAmount: pending.amount,
+        });
+      }
+    }
+  }
+
+  res.json({
+    ok: true,
+    creditedBalance: creditedBalance ?? null,
+    sweepRelayId: sweepRelayId ?? null,
+  });
 });
 
 // ─── POST /withdraw ───────────────────────────────────────────────────────────
