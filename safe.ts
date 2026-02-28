@@ -128,7 +128,7 @@ async function loadBytecode(): Promise<`0x${string}`> {
   const dir = fileURLToPath(new URL(".", import.meta.url));
   const artifactPath = resolve(
     dir,
-    "../my-sc/out/SpendInteractor.sol/SpendInteractor.json"
+    "../my-sc/out/SpendInteractor.sol/SpendInteractor.json",
   );
   const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
   return artifact.bytecode.object as `0x${string}`;
@@ -141,7 +141,9 @@ export type DeployResult = {
   spendInteractorAddress: string;
 };
 
-export async function deployUserSafe(userAddress: string): Promise<DeployResult> {
+export async function deployUserSafe(
+  userAddress: string,
+): Promise<DeployResult> {
   const adminPrivateKey = getAdminPrivateKey();
   const adminAccount = privateKeyToAccount(adminPrivateKey);
   const rpcUrl = process.env.RPC_URL!;
@@ -160,7 +162,12 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
     owners: [adminAccount.address],
     threshold: 1,
   };
-  const predictedSafe: PredictedSafeProps = { safeAccountConfig };
+  // Use the user address as the salt so each user gets a unique Safe address
+  const saltNonce = BigInt(userAddress.toLowerCase()).toString();
+  const predictedSafe: PredictedSafeProps = {
+    safeAccountConfig,
+    safeDeploymentConfig: { saltNonce },
+  };
 
   const protocolKit = await Safe.init({
     provider: rpcUrl,
@@ -173,7 +180,9 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
   // Safe already on-chain: a previous run crashed mid-sequence.
   // Re-init against the deployed Safe and resume from the failed step.
   if (await protocolKit.isSafeDeployed()) {
-    console.log(`[safe] Safe already deployed at ${safeAddress} — resuming setup`);
+    console.log(
+      `[safe] Safe already deployed at ${safeAddress} for ${userAddress} — resuming setup`,
+    );
 
     const safeSdk = await Safe.init({
       provider: rpcUrl,
@@ -188,7 +197,9 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
     if (modules.length > 0) {
       // enableModule already ran — use the existing module address
       spendInteractorAddress = modules[0];
-      console.log(`[safe] SpendInteractor already enabled: ${spendInteractorAddress}`);
+      console.log(
+        `[safe] SpendInteractor already enabled: ${spendInteractorAddress}`,
+      );
     } else {
       // SpendInteractor was never enabled (or was deployed but orphaned) — re-deploy
       console.log(`[safe] No module found — re-deploying SpendInteractor`);
@@ -198,26 +209,46 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
         bytecode,
         args: [safeAddress as `0x${string}`, adminAccount.address],
       });
-      const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployTxHash });
-      if (!deployReceipt.contractAddress) throw new Error("SpendInteractor re-deploy failed");
+      const deployReceipt = await publicClient.waitForTransactionReceipt({
+        hash: deployTxHash,
+      });
+      if (!deployReceipt.contractAddress)
+        throw new Error("SpendInteractor re-deploy failed");
       spendInteractorAddress = deployReceipt.contractAddress;
-      console.log(`[safe] SpendInteractor re-deployed at ${spendInteractorAddress}`);
+      console.log(
+        `[safe] SpendInteractor re-deployed at ${spendInteractorAddress}`,
+      );
 
-      const enableModuleTx = await safeSdk.createEnableModuleTx(spendInteractorAddress);
-      const signedEnableModuleTx = await safeSdk.signTransaction(enableModuleTx);
-      const enableResult = await safeSdk.executeTransaction(signedEnableModuleTx);
-      await publicClient.waitForTransactionReceipt({ hash: enableResult.hash as `0x${string}` });
+      const enableModuleTx = await safeSdk.createEnableModuleTx(
+        spendInteractorAddress,
+      );
+      const signedEnableModuleTx =
+        await safeSdk.signTransaction(enableModuleTx);
+      const enableResult =
+        await safeSdk.executeTransaction(signedEnableModuleTx);
+      await publicClient.waitForTransactionReceipt({
+        hash: enableResult.hash as `0x${string}`,
+      });
       console.log(`[safe] SpendInteractor module enabled on Safe`);
     }
 
     // Step 5 check: is the user already an owner?
     const owners = await safeSdk.getOwners();
-    if (!owners.map((o) => o.toLowerCase()).includes(userAddress.toLowerCase())) {
-      const addOwnerTx = await safeSdk.createAddOwnerTx({ ownerAddress: userAddress, threshold: 2 });
+    if (
+      !owners.map((o) => o.toLowerCase()).includes(userAddress.toLowerCase())
+    ) {
+      const addOwnerTx = await safeSdk.createAddOwnerTx({
+        ownerAddress: userAddress,
+        threshold: 2,
+      });
       const signedAddOwnerTx = await safeSdk.signTransaction(addOwnerTx);
       const addOwnerResult = await safeSdk.executeTransaction(signedAddOwnerTx);
-      await publicClient.waitForTransactionReceipt({ hash: addOwnerResult.hash as `0x${string}` });
-      console.log(`[safe] User ${userAddress} added as owner, threshold set to 2`);
+      await publicClient.waitForTransactionReceipt({
+        hash: addOwnerResult.hash as `0x${string}`,
+      });
+      console.log(
+        `[safe] User ${userAddress} added as owner, threshold set to 2`,
+      );
     } else {
       console.log(`[safe] User ${userAddress} already an owner`);
     }
@@ -242,7 +273,10 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
   });
 
   const spendInteractorAddress = deployReceipt.contractAddress;
-  if (!spendInteractorAddress) throw new Error("SpendInteractor deployment failed — no contract address in receipt");
+  if (!spendInteractorAddress)
+    throw new Error(
+      "SpendInteractor deployment failed — no contract address in receipt",
+    );
 
   console.log(`[safe] SpendInteractor deployed at ${spendInteractorAddress}`);
 
@@ -270,7 +304,9 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
   });
 
   // enableModule(spendInteractorAddress)
-  const enableModuleTx = await safeSdk.createEnableModuleTx(spendInteractorAddress);
+  const enableModuleTx = await safeSdk.createEnableModuleTx(
+    spendInteractorAddress,
+  );
   const signedEnableModuleTx = await safeSdk.signTransaction(enableModuleTx);
   const enableResult = await safeSdk.executeTransaction(signedEnableModuleTx);
   await publicClient.waitForTransactionReceipt({
