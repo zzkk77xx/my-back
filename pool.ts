@@ -17,9 +17,32 @@
 
 import type { PrismaClient } from "@prisma/client";
 import type { Unlink } from "@unlink-xyz/node";
-import { createWalletClient, http } from "viem";
+import { createPublicClient, createWalletClient, http, maxUint256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { AUDIT_ACTIONS, logAudit } from "./audit.js";
+
+const ERC20_ABI = [
+  {
+    type: "function",
+    name: "allowance",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "approve",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+    stateMutability: "nonpayable",
+  },
+] as const;
 
 const FUNDER_KEY = process.env.POOL_FUNDER_PRIVATE_KEY as
   | `0x${string}`
@@ -104,15 +127,22 @@ export function startPoolMonitor(prisma: PrismaClient, unlink: Unlink): void {
   const rpcUrl = process.env.RPC_URL!;
   const chainId = Number(process.env.CHAIN_ID ?? 10143);
 
+  const chain = {
+    id: chainId,
+    name: "monad-testnet",
+    nativeCurrency: { name: "MON", symbol: "MON", decimals: 18 },
+    rpcUrls: { default: { http: [rpcUrl] } },
+  } as const;
+
   const walletClient = createWalletClient({
     account: funderAccount,
     transport: http(rpcUrl),
-    chain: {
-      id: chainId,
-      name: "monad-testnet",
-      nativeCurrency: { name: "MON", symbol: "MON", decimals: 18 },
-      rpcUrls: { default: { http: [rpcUrl] } },
-    },
+    chain,
+  });
+
+  const publicClient = createPublicClient({
+    transport: http(rpcUrl),
+    chain,
   });
 
   console.log(
@@ -141,14 +171,37 @@ export function startPoolMonitor(prisma: PrismaClient, unlink: Unlink): void {
           deposits: [{ token: TOKEN_ADDRESS!, amount: TOP_UP_AMOUNT }],
         });
 
-        // 2. Submit deposit tx from funder wallet
+        // 2. Ensure ERC-20 allowance for the deposit contract
+        const spender = deposit.to as `0x${string}`;
+        const allowance = await publicClient.readContract({
+          address: TOKEN_ADDRESS!,
+          abi: ERC20_ABI,
+          functionName: "allowance",
+          args: [funderAccount.address, spender],
+        });
+
+        if (allowance < TOP_UP_AMOUNT) {
+          console.log(
+            `[pool] Approving ${spender} to spend token (current allowance: ${allowance})`,
+          );
+          const approveTx = await walletClient.writeContract({
+            address: TOKEN_ADDRESS!,
+            abi: ERC20_ABI,
+            functionName: "approve",
+            args: [spender, maxUint256],
+          });
+          await publicClient.waitForTransactionReceipt({ hash: approveTx });
+          console.log(`[pool] Approval tx confirmed: ${approveTx}`);
+        }
+
+        // 3. Submit deposit tx from funder wallet
         const txHash = await walletClient.sendTransaction({
           to: deposit.to as `0x${string}`,
           value: BigInt(deposit.value),
           data: deposit.calldata as `0x${string}`,
         });
 
-        // 3. Confirm deposit
+        // 4. Confirm deposit
         await unlink.confirmDeposit(deposit.relayId);
 
         lastTopUpTime = new Date();
