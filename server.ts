@@ -532,7 +532,17 @@ app.post("/policy/validate", requirePrivyAuth, async (req: Request, res: Respons
 
 app.get("/pool/status", async (_req: Request, res: Response) => {
   const status = await getPoolStatus(unlink);
-  res.json(status);
+
+  // Attach token decimals from watched contracts table (defaults to 6 for USDC)
+  let tokenDecimals = 6;
+  if (status.tokenAddress) {
+    const contract = await prisma.watchedContract.findUnique({
+      where: { address: status.tokenAddress.toLowerCase() },
+    });
+    if (contract) tokenDecimals = contract.tokenDecimals;
+  }
+
+  res.json({ ...status, tokenDecimals });
 });
 
 // ─── POST /users/:addr/deposit ───────────────────────────────────────────────
@@ -592,6 +602,95 @@ app.get("/audit", requirePrivyAuth, async (req: Request, res: Response) => {
 
   const logs = await queryAuditLogs(prisma, { action, userId, limit, offset });
   res.json(logs);
+});
+
+// ─── GET /ledger/summary ─────────────────────────────────────────────────────
+//
+// Returns the sum of all UserBalance records as 18-decimal USD string.
+// This represents total deposits across all registered users.
+
+app.get("/ledger/summary", async (_req: Request, res: Response) => {
+  const balances = await prisma.userBalance.findMany({
+    select: { balance: true },
+  });
+  const total = balances.reduce((sum, b) => sum + BigInt(b.balance), 0n);
+  res.json({ totalDeposits: total.toString() });
+});
+
+// ─── GET /sub-accounts ────────────────────────────────────────────────────────
+
+app.get("/sub-accounts", async (_req: Request, res: Response) => {
+  const accounts = await prisma.subAccount.findMany({
+    orderBy: { createdAt: "asc" },
+  });
+  res.json(accounts);
+});
+
+// ─── POST /sub-accounts ───────────────────────────────────────────────────────
+//
+// Body: { name, operator, balance?, deployed?, dailyLimit?, spentToday?, status?, protocols?, pnl?, perfData? }
+
+app.post("/sub-accounts", async (req: Request, res: Response) => {
+  const {
+    name,
+    operator,
+    balance = 0,
+    deployed = 0,
+    dailyLimit = 500_000,
+    spentToday = 0,
+    status = "active",
+    protocols = "[]",
+    pnl = 0,
+    perfData = "[]",
+  } = req.body as {
+    name: string;
+    operator: string;
+    balance?: number;
+    deployed?: number;
+    dailyLimit?: number;
+    spentToday?: number;
+    status?: string;
+    protocols?: string;
+    pnl?: number;
+    perfData?: string;
+  };
+
+  if (!name || !operator) {
+    res.status(400).json({ error: "name and operator are required" });
+    return;
+  }
+
+  const account = await prisma.subAccount.create({
+    data: { name, operator, balance, deployed, dailyLimit, spentToday, status, protocols, pnl, perfData },
+  });
+
+  res.status(201).json(account);
+});
+
+// ─── PATCH /sub-accounts/:id ──────────────────────────────────────────────────
+//
+// Body: any subset of { dailyLimit, protocols, status, balance, deployed, spentToday, pnl, perfData }
+
+app.patch("/sub-accounts/:id", async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+
+  const account = await prisma.subAccount.update({
+    where: { id },
+    data: {
+      ...req.body,
+      lastActivity: new Date(),
+    },
+  });
+
+  res.json(account);
+});
+
+// ─── DELETE /sub-accounts/:id ─────────────────────────────────────────────────
+
+app.delete("/sub-accounts/:id", async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  await prisma.subAccount.delete({ where: { id } });
+  res.json({ ok: true });
 });
 
 // ─── Error handler ────────────────────────────────────────────────────────────
