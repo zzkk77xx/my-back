@@ -17,6 +17,7 @@
 
 import { PrismaClient } from "@prisma/client";
 import { initUnlink, type Unlink } from "@unlink-xyz/node";
+import cors from "cors";
 import express, { type Request, type Response } from "express";
 import { createPublicClient, createWalletClient, encodePacked, http, keccak256 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -73,6 +74,7 @@ async function initWallet() {
 // ─── App ──────────────────────────────────────────────────────────────────────
 
 const app = express();
+app.use(cors({ origin: process.env.CORS_ORIGIN ?? "http://localhost:5173" }));
 app.use(express.json());
 
 // ─── POST /users/register ─────────────────────────────────────────────────────

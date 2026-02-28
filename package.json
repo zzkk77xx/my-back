@@ -15,6 +15,7 @@
   "license": "ISC",
   "type": "module",
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "prisma": "^6.19.2",
     "tsx": "^4.21.0",
@@ -25,6 +26,7 @@
     "@privy-io/node": "^0.10.0",
     "@safe-global/protocol-kit": "^6.1.2",
     "@unlink-xyz/node": "0.1.7-canary.7512856",
+    "cors": "^2.8.6",
     "express": "^5.2.1",
     "viem": "^2.46.3"
   }

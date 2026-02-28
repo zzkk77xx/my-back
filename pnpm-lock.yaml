@@ -17,6 +17,9 @@ dependencies:
   '@unlink-xyz/node':
     specifier: 0.1.7-canary.7512856
     version: 0.1.7-canary.7512856
+  cors:
+    specifier: ^2.8.6
+    version: 2.8.6
   express:
     specifier: ^5.2.1
     version: 5.2.1
@@ -25,6 +28,9 @@ dependencies:
     version: 2.46.3(typescript@5.9.3)
 
 devDependencies:
+  '@types/cors':
+    specifier: ^2.8.19
+    version: 2.8.19
   '@types/express':
     specifier: ^5.0.6
     version: 5.0.6
@@ -477,7 +483,7 @@ packages:
       semver: 7.7.4
       viem: 2.46.3(typescript@5.9.3)
     optionalDependencies:
-      '@noble/curves': 1.9.1
+      '@noble/curves': 1.9.7
       '@peculiar/asn1-schema': 2.6.0
     transitivePeerDependencies:
       - bufferutil
@@ -551,6 +557,12 @@ packages:
 
   /@types/connect@3.4.38:
     resolution: {integrity: sha512-K6uROf1LD88uDQqJCktA4yzL1YYAK6NgfsI0v/mTgyPKWsX1CnJ0XPSDhViejru1GcRkLWb8RlzFYJRqGUbaug==}
+    dependencies:
+      '@types/node': 22.7.5
+    dev: true
+
+  /@types/cors@2.8.19:
+    resolution: {integrity: sha512-mFNylyeyqN93lfe/9CSxOGREz8cpzAhH+E93xJ4xWQf62V8sQ/24reV2nyzUWM6H6Xji+GGHpkbLe7pVoUEskg==}
     dependencies:
       '@types/node': 22.7.5
     dev: true
@@ -900,6 +912,14 @@ packages:
   /cookie@0.7.2:
     resolution: {integrity: sha512-yki5XnKuf750l50uGTllt6kKILY4nQ1eNIQatoXEByZ5dWgnKqbnqmTrBE5B4N7lrMJKQ2ytWMiTO2o0v6Ew/w==}
     engines: {node: '>= 0.6'}
+    dev: false
+
+  /cors@2.8.6:
+    resolution: {integrity: sha512-tJtZBBHA6vjIAaF6EnIaq6laBBP9aq/Y3ouVJjEfoHbRBcHBAHYcMh/w8LDrk2PvIMMq8gmopa5D4V8RmbrxGw==}
+    engines: {node: '>= 0.10'}
+    dependencies:
+      object-assign: 4.1.1
+      vary: 1.1.2
     dev: false
 
   /debug@4.4.3:
@@ -1473,6 +1493,11 @@ packages:
       citty: 0.2.1
       pathe: 2.0.3
       tinyexec: 1.0.2
+
+  /object-assign@4.1.1:
+    resolution: {integrity: sha512-rJgTQnkUnH1sFw8yT6VSU3zD3sWmu6sZhIseY8VX+GRu3P6F7Fu+JNDoXfklElbLJSnc3FUQHVe4cU5hj+BcUg==}
+    engines: {node: '>=0.10.0'}
+    dev: false
 
   /object-inspect@1.13.4:
     resolution: {integrity: sha512-W67iLl4J2EXEGTbfeHCffrjDfitvLANg0UlX3wFUUSTx92KXRFegMHUVgSqE+wvhAbi4WqjGg9czysTV2Epbew==}
