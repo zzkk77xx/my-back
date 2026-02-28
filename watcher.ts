@@ -92,6 +92,7 @@ async function fetchAndPersistNewEvents(
 // ─── Envio GraphQL source ────────────────────────────────────────────────────
 
 interface EnvioSpendAuthorized {
+  srcAddress: string;
   m2: string;
   eoa: string;
   amount: string;
@@ -118,6 +119,7 @@ async function fetchViaEnvio(
         where: { blockNumber: { _gt: $sinceBlock } }
         order_by: { blockNumber: asc, logIndex: asc }
       ) {
+        srcAddress
         m2
         eoa
         amount
@@ -183,7 +185,7 @@ async function fetchViaEnvio(
             blockNumber: BigInt(e.blockNumber),
             txHash: e.txHash,
             logIndex: e.logIndex,
-            contractAddress: e.m2.toLowerCase(), // m2 is the SpendInteractor address
+            contractAddress: e.srcAddress.toLowerCase(),
             m2: e.m2.toLowerCase(),
             eoa: e.eoa.toLowerCase(),
             amount: e.amount,
