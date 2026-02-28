@@ -18,7 +18,10 @@
 import { PrismaClient } from "@prisma/client";
 import { initUnlink, type Unlink } from "@unlink-xyz/node";
 import express, { type Request, type Response } from "express";
-import { deployUserSafe } from "./safe.js";
+import { createPublicClient, createWalletClient, encodePacked, http, keccak256 } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+import { requirePrivyAuth } from "./auth.js";
+import { SPEND_INTERACTOR_ABI, deployUserSafe } from "./safe.js";
 import { startWatcher } from "./watcher.js";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -28,6 +31,26 @@ if (!MNEMONIC) throw new Error("UNLINK_MNEMONIC env var is required");
 
 const DEFAULT_RECIPIENT = process.env.SAFE_ADDRESS as `0x${string}` | undefined;
 const PORT = Number(process.env.PORT ?? 3000);
+const CHAIN_ID = Number(process.env.CHAIN_ID ?? 10143);
+const RPC_URL = process.env.RPC_URL!;
+
+// viem clients reused for EOA registration calls
+const _chain = {
+  id: CHAIN_ID,
+  name: "monad-testnet",
+  nativeCurrency: { name: "MON", symbol: "MON", decimals: 18 },
+  rpcUrls: { default: { http: [RPC_URL] } },
+} as const;
+
+const _adminAccount = process.env.ADMIN_PRIVATE_KEY
+  ? privateKeyToAccount(process.env.ADMIN_PRIVATE_KEY as `0x${string}`)
+  : undefined;
+
+const _walletClient = _adminAccount
+  ? createWalletClient({ account: _adminAccount, transport: http(RPC_URL), chain: _chain })
+  : undefined;
+
+const _publicClient = createPublicClient({ transport: http(RPC_URL), chain: _chain });
 
 // ─── Singletons ───────────────────────────────────────────────────────────────
 
@@ -57,7 +80,7 @@ app.use(express.json());
 // Body: { address: "0x..." }
 // Idempotent: returns the existing Safe address if the user is already registered.
 
-app.post("/users/register", async (req: Request, res: Response) => {
+app.post("/users/register", requirePrivyAuth, async (req: Request, res: Response) => {
   const { address } = req.body as { address: string };
 
   if (!address) {
@@ -74,13 +97,113 @@ app.post("/users/register", async (req: Request, res: Response) => {
     return;
   }
 
-  const { safeAddress } = await deployUserSafe(address);
+  const { safeAddress, spendInteractorAddress } = await deployUserSafe(address);
 
   const user = await prisma.user.create({
-    data: { address: normalized, safeAddress: safeAddress.toLowerCase() },
+    data: {
+      address: normalized,
+      safeAddress: safeAddress.toLowerCase(),
+      spendInteractorAddress: spendInteractorAddress.toLowerCase(),
+    },
   });
 
   res.status(201).json({ safeAddress: user.safeAddress, created: true });
+});
+
+// ─── POST /users/:userAddress/eoas ────────────────────────────────────────────
+//
+// Registers an EOA on the user's SpendInteractor.
+// Body: { eoa: "0x...", dailyLimit: "1000000000000000000", allowedTypes: [0, 1] }
+// Admin calls registerEOA() directly (SpendInteractor owner = admin).
+
+app.post("/users/:userAddress/eoas", requirePrivyAuth, async (req: Request, res: Response) => {
+  const { userAddress } = req.params;
+  const { eoa, dailyLimit, allowedTypes } = req.body as {
+    eoa: string;
+    dailyLimit: string;
+    allowedTypes: number[];
+  };
+
+  if (!eoa || !dailyLimit || !allowedTypes) {
+    res.status(400).json({ error: "eoa, dailyLimit, and allowedTypes are required" });
+    return;
+  }
+
+  if (!_walletClient || !_adminAccount) {
+    res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { address: userAddress.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const txHash = await _walletClient.writeContract({
+    address: user.spendInteractorAddress as `0x${string}`,
+    abi: SPEND_INTERACTOR_ABI,
+    functionName: "registerEOA",
+    args: [eoa as `0x${string}`, BigInt(dailyLimit), allowedTypes],
+  });
+
+  await _publicClient.waitForTransactionReceipt({ hash: txHash });
+
+  res.status(201).json({ txHash, eoa, spendInteractorAddress: user.spendInteractorAddress });
+});
+
+// ─── GET /users/:userAddress/eoas ─────────────────────────────────────────────
+
+app.get("/users/:userAddress/eoas", async (req: Request, res: Response) => {
+  const { userAddress } = req.params;
+
+  const user = await prisma.user.findUnique({
+    where: { address: userAddress.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const eoas = await _publicClient.readContract({
+    address: user.spendInteractorAddress as `0x${string}`,
+    abi: SPEND_INTERACTOR_ABI,
+    functionName: "getRegisteredEOAs",
+  });
+
+  res.json({ eoas, spendInteractorAddress: user.spendInteractorAddress });
+});
+
+// ─── DELETE /users/:userAddress/eoas/:eoa ─────────────────────────────────────
+
+app.delete("/users/:userAddress/eoas/:eoa", requirePrivyAuth, async (req: Request, res: Response) => {
+  const { userAddress, eoa } = req.params;
+
+  if (!_walletClient) {
+    res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { address: userAddress.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const txHash = await _walletClient.writeContract({
+    address: user.spendInteractorAddress as `0x${string}`,
+    abi: SPEND_INTERACTOR_ABI,
+    functionName: "revokeEOA",
+    args: [eoa as `0x${string}`],
+  });
+
+  await _publicClient.waitForTransactionReceipt({ hash: txHash });
+
+  res.json({ txHash, eoa });
 });
 
 // ─── GET /account ─────────────────────────────────────────────────────────────
@@ -283,6 +406,31 @@ app.post("/recipients", async (req: Request, res: Response) => {
   const mapping = await prisma.recipientMapping.upsert({
     where: { hash: hash.toLowerCase() },
     create: { hash: hash.toLowerCase(), address: address.toLowerCase(), label },
+    update: { address: address.toLowerCase(), label },
+  });
+
+  res.status(201).json(mapping);
+});
+
+// ─── POST /recipients/by-address ──────────────────────────────────────────────
+//
+// Convenience: takes just an address and auto-computes the recipientHash via
+// keccak256(encodePacked(address)), matching Solidity's convention.
+// Body: { address: "0x...", label?: "..." }
+
+app.post("/recipients/by-address", async (req: Request, res: Response) => {
+  const { address, label } = req.body as { address: string; label?: string };
+
+  if (!address) {
+    res.status(400).json({ error: "address is required" });
+    return;
+  }
+
+  const hash = keccak256(encodePacked(["address"], [address as `0x${string}`]));
+
+  const mapping = await prisma.recipientMapping.upsert({
+    where: { hash },
+    create: { hash, address: address.toLowerCase(), label },
     update: { address: address.toLowerCase(), label },
   });
 

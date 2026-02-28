@@ -1,21 +1,105 @@
 /**
- * Safe multisig deployment helper.
+ * Safe + SpendInteractor onboarding helper.
  *
- * Deploys a 2/2 Safe for a new user using the Safe Protocol Kit.
- * Owners: [userAddress, ADMIN_ADDRESS derived from ADMIN_PRIVATE_KEY]
- * Threshold: 2
+ * Atomic deployment sequence for a new user:
+ *   1. Predict the Safe address (deterministic CREATE2)
+ *   2. Deploy SpendInteractor (avatar = predictedSafe, owner = admin)
+ *   3. Deploy Safe with owners=[admin], threshold=1
+ *   4. Execute Safe tx: enableModule(spendInteractorAddress)
+ *   5. Execute Safe tx: addOwnerWithThreshold(userAddress, 2)
+ *      → Safe is now 2/2, module enabled, admin retains SpendInteractor ownership
+ *         so registerEOA() can be called directly without Safe sigs.
  *
  * Env vars:
- *   ADMIN_PRIVATE_KEY - 0x-prefixed private key of the admin (co-owner + gas payer)
- *   RPC_URL           - HTTP JSON-RPC endpoint
- *   CHAIN_ID          - Chain ID (default: 10143 for monad-testnet)
+ *   ADMIN_PRIVATE_KEY  - 0x-prefixed private key (admin = 2nd Safe owner + gas payer)
+ *   RPC_URL            - HTTP JSON-RPC endpoint
+ *   CHAIN_ID           - Chain ID (default: 10143 for monad-testnet)
  */
 
 import Safe, {
   type PredictedSafeProps,
   type SafeAccountConfig,
 } from "@safe-global/protocol-kit";
-import { type Chain, privateKeyToAccount } from "viem/accounts";
+import { createPublicClient, createWalletClient, http, type Chain } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
+
+// ─── SpendInteractor ABI (only what we need) ──────────────────────────────────
+
+export const SPEND_INTERACTOR_ABI = [
+  {
+    type: "constructor",
+    inputs: [
+      { name: "_avatar", type: "address" },
+      { name: "_owner", type: "address" },
+    ],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "registerEOA",
+    inputs: [
+      { name: "eoa", type: "address" },
+      { name: "dailyLimit", type: "uint256" },
+      { name: "allowedTypes", type: "uint8[]" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "revokeEOA",
+    inputs: [{ name: "eoa", type: "address" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "updateLimit",
+    inputs: [
+      { name: "eoa", type: "address" },
+      { name: "newDailyLimit", type: "uint256" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "getRegisteredEOAs",
+    inputs: [],
+    outputs: [{ name: "", type: "address[]" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "isRegisteredEOA",
+    inputs: [{ name: "eoa", type: "address" }],
+    outputs: [{ name: "", type: "bool" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getDailyLimit",
+    inputs: [{ name: "eoa", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getRemainingLimit",
+    inputs: [{ name: "eoa", type: "address" }],
+    outputs: [{ name: "", type: "uint256" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getAllowedTypesBitmap",
+    inputs: [{ name: "eoa", type: "address" }],
+    outputs: [{ name: "", type: "uint8" }],
+    stateMutability: "view",
+  },
+] as const;
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const CHAIN_ID = Number(process.env.CHAIN_ID ?? 10143);
 
@@ -36,25 +120,49 @@ function getChain(): Chain {
   };
 }
 
-/**
- * Deploy a 2/2 Safe for a user.
- * Returns the deterministic Safe address (same result if called twice with the same userAddress).
- */
-export async function deployUserSafe(
-  userAddress: string
-): Promise<{ safeAddress: string; alreadyExists: boolean }> {
+async function loadBytecode(): Promise<`0x${string}`> {
+  const { readFile } = await import("fs/promises");
+  const { resolve } = await import("path");
+  const { fileURLToPath } = await import("url");
+
+  const dir = fileURLToPath(new URL(".", import.meta.url));
+  const artifactPath = resolve(
+    dir,
+    "../my-sc/out/SpendInteractor.sol/SpendInteractor.json"
+  );
+  const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
+  return artifact.bytecode.object as `0x${string}`;
+}
+
+// ─── Main export ──────────────────────────────────────────────────────────────
+
+export type DeployResult = {
+  safeAddress: string;
+  spendInteractorAddress: string;
+  alreadyExists: boolean;
+};
+
+export async function deployUserSafe(userAddress: string): Promise<DeployResult> {
   const adminPrivateKey = getAdminPrivateKey();
-  const adminAddress = privateKeyToAccount(adminPrivateKey).address;
+  const adminAccount = privateKeyToAccount(adminPrivateKey);
   const rpcUrl = process.env.RPC_URL!;
+  const chain = getChain();
+
+  const walletClient = createWalletClient({
+    account: adminAccount,
+    transport: http(rpcUrl),
+    chain,
+  });
+  const publicClient = createPublicClient({ transport: http(rpcUrl), chain });
+
+  // ── Step 1: predict Safe address ────────────────────────────────────────────
 
   const safeAccountConfig: SafeAccountConfig = {
-    owners: [userAddress, adminAddress],
-    threshold: 2,
+    owners: [adminAccount.address],
+    threshold: 1,
   };
-
   const predictedSafe: PredictedSafeProps = { safeAccountConfig };
 
-  // Initialize Protocol Kit in "predicted" mode to get the deterministic address
   const protocolKit = await Safe.init({
     provider: rpcUrl,
     signer: adminPrivateKey,
@@ -62,33 +170,73 @@ export async function deployUserSafe(
   });
 
   const safeAddress = await protocolKit.getAddress();
-  const alreadyDeployed = await protocolKit.isSafeDeployed();
 
-  if (alreadyDeployed) {
-    return { safeAddress, alreadyExists: true };
+  // Idempotency: if already deployed, reconstruct addresses and return
+  if (await protocolKit.isSafeDeployed()) {
+    // Try to find the SpendInteractor by checking owners — can't recover address
+    // from chain alone without events; caller should check DB instead.
+    return { safeAddress, spendInteractorAddress: "", alreadyExists: true };
   }
 
-  console.log(`[safe] Deploying 2/2 Safe for ${userAddress} at ${safeAddress} ...`);
+  console.log(`[safe] Predicted Safe address: ${safeAddress}`);
 
-  // Build the deployment transaction
+  // ── Step 2: deploy SpendInteractor (avatar=safe, owner=admin) ───────────────
+
+  const bytecode = await loadBytecode();
+
+  const deployTxHash = await walletClient.deployContract({
+    abi: SPEND_INTERACTOR_ABI,
+    bytecode,
+    args: [safeAddress as `0x${string}`, adminAccount.address],
+  });
+
+  const deployReceipt = await publicClient.waitForTransactionReceipt({
+    hash: deployTxHash,
+  });
+
+  const spendInteractorAddress = deployReceipt.contractAddress;
+  if (!spendInteractorAddress) throw new Error("SpendInteractor deployment failed — no contract address in receipt");
+
+  console.log(`[safe] SpendInteractor deployed at ${spendInteractorAddress}`);
+
+  // ── Step 3: deploy Safe (owners=[admin], threshold=1) ───────────────────────
+
   const deploymentTx = await protocolKit.createSafeDeploymentTransaction();
 
-  // Execute via the viem signer the Protocol Kit manages
-  const client = await protocolKit.getSafeProvider().getExternalSigner();
-  if (!client) throw new Error("Could not obtain external signer from Protocol Kit");
-
-  const chain = getChain();
-
-  const txHash = await client.sendTransaction({
+  const safeTxHash = await walletClient.sendTransaction({
     to: deploymentTx.to as `0x${string}`,
     value: BigInt(deploymentTx.value),
     data: deploymentTx.data as `0x${string}`,
-    chain,
   });
 
-  await client.waitForTransactionReceipt({ hash: txHash });
+  await publicClient.waitForTransactionReceipt({ hash: safeTxHash });
 
-  console.log(`[safe] Safe deployed at ${safeAddress} (tx: ${txHash})`);
+  console.log(`[safe] Safe deployed at ${safeAddress}`);
 
-  return { safeAddress, alreadyExists: false };
+  // ── Steps 4 & 5: enableModule + addOwnerWithThreshold via Protocol Kit ──────
+
+  const safeSdk = await protocolKit.connect({ safeAddress });
+
+  // enableModule(spendInteractorAddress)
+  const enableModuleTx = await safeSdk.createEnableModuleTx(spendInteractorAddress);
+  const enableResult = await safeSdk.executeTransaction(enableModuleTx);
+  await publicClient.waitForTransactionReceipt({
+    hash: enableResult.hash as `0x${string}`,
+  });
+
+  console.log(`[safe] SpendInteractor module enabled on Safe`);
+
+  // addOwnerWithThreshold(userAddress, 2) — atomically adds user + raises threshold
+  const addOwnerTx = await safeSdk.createAddOwnerTx({
+    ownerAddress: userAddress,
+    threshold: 2,
+  });
+  const addOwnerResult = await safeSdk.executeTransaction(addOwnerTx);
+  await publicClient.waitForTransactionReceipt({
+    hash: addOwnerResult.hash as `0x${string}`,
+  });
+
+  console.log(`[safe] User ${userAddress} added as owner, threshold set to 2`);
+
+  return { safeAddress, spendInteractorAddress, alreadyExists: false };
 }

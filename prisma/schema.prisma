@@ -58,10 +58,11 @@ model RecipientMapping {
 
 // Registered users and their deployed 2/2 Safe addresses
 model User {
-  id          Int      @id @default(autoincrement())
-  address     String   @unique @db.VarChar(42) // user EOA
-  safeAddress String   @db.VarChar(42)         // deployed 2/2 Safe
-  createdAt   DateTime @default(now())
+  id                     Int      @id @default(autoincrement())
+  address                String   @unique @db.VarChar(42) // user EOA
+  safeAddress            String   @db.VarChar(42)         // deployed 2/2 Safe
+  spendInteractorAddress String   @db.VarChar(42)         // SpendInteractor module for this Safe
+  createdAt              DateTime @default(now())
 
   @@map("users")
 }
