@@ -139,7 +139,6 @@ async function loadBytecode(): Promise<`0x${string}`> {
 export type DeployResult = {
   safeAddress: string;
   spendInteractorAddress: string;
-  alreadyExists: boolean;
 };
 
 export async function deployUserSafe(userAddress: string): Promise<DeployResult> {
@@ -171,11 +170,59 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
 
   const safeAddress = await protocolKit.getAddress();
 
-  // Idempotency: if already deployed, reconstruct addresses and return
+  // Safe already on-chain: a previous run crashed mid-sequence.
+  // Re-init against the deployed Safe and resume from the failed step.
   if (await protocolKit.isSafeDeployed()) {
-    // Try to find the SpendInteractor by checking owners — can't recover address
-    // from chain alone without events; caller should check DB instead.
-    return { safeAddress, spendInteractorAddress: "", alreadyExists: true };
+    console.log(`[safe] Safe already deployed at ${safeAddress} — resuming setup`);
+
+    const safeSdk = await Safe.init({
+      provider: rpcUrl,
+      signer: adminPrivateKey,
+      safeAddress,
+    });
+
+    // Step 4 check: is a module already enabled?
+    const modules = await safeSdk.getModules();
+    let spendInteractorAddress: string;
+
+    if (modules.length > 0) {
+      // enableModule already ran — use the existing module address
+      spendInteractorAddress = modules[0];
+      console.log(`[safe] SpendInteractor already enabled: ${spendInteractorAddress}`);
+    } else {
+      // SpendInteractor was never enabled (or was deployed but orphaned) — re-deploy
+      console.log(`[safe] No module found — re-deploying SpendInteractor`);
+      const bytecode = await loadBytecode();
+      const deployTxHash = await walletClient.deployContract({
+        abi: SPEND_INTERACTOR_ABI,
+        bytecode,
+        args: [safeAddress as `0x${string}`, adminAccount.address],
+      });
+      const deployReceipt = await publicClient.waitForTransactionReceipt({ hash: deployTxHash });
+      if (!deployReceipt.contractAddress) throw new Error("SpendInteractor re-deploy failed");
+      spendInteractorAddress = deployReceipt.contractAddress;
+      console.log(`[safe] SpendInteractor re-deployed at ${spendInteractorAddress}`);
+
+      const enableModuleTx = await safeSdk.createEnableModuleTx(spendInteractorAddress);
+      const signedEnableModuleTx = await safeSdk.signTransaction(enableModuleTx);
+      const enableResult = await safeSdk.executeTransaction(signedEnableModuleTx);
+      await publicClient.waitForTransactionReceipt({ hash: enableResult.hash as `0x${string}` });
+      console.log(`[safe] SpendInteractor module enabled on Safe`);
+    }
+
+    // Step 5 check: is the user already an owner?
+    const owners = await safeSdk.getOwners();
+    if (!owners.map((o) => o.toLowerCase()).includes(userAddress.toLowerCase())) {
+      const addOwnerTx = await safeSdk.createAddOwnerTx({ ownerAddress: userAddress, threshold: 2 });
+      const signedAddOwnerTx = await safeSdk.signTransaction(addOwnerTx);
+      const addOwnerResult = await safeSdk.executeTransaction(signedAddOwnerTx);
+      await publicClient.waitForTransactionReceipt({ hash: addOwnerResult.hash as `0x${string}` });
+      console.log(`[safe] User ${userAddress} added as owner, threshold set to 2`);
+    } else {
+      console.log(`[safe] User ${userAddress} already an owner`);
+    }
+
+    return { safeAddress, spendInteractorAddress };
   }
 
   console.log(`[safe] Predicted Safe address: ${safeAddress}`);
@@ -215,11 +262,17 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
 
   // ── Steps 4 & 5: enableModule + addOwnerWithThreshold via Protocol Kit ──────
 
-  const safeSdk = await protocolKit.connect({ safeAddress });
+  // Re-init against the now-deployed Safe (predictedSafe mode can't sign/execute)
+  const safeSdk = await Safe.init({
+    provider: rpcUrl,
+    signer: adminPrivateKey,
+    safeAddress,
+  });
 
   // enableModule(spendInteractorAddress)
   const enableModuleTx = await safeSdk.createEnableModuleTx(spendInteractorAddress);
-  const enableResult = await safeSdk.executeTransaction(enableModuleTx);
+  const signedEnableModuleTx = await safeSdk.signTransaction(enableModuleTx);
+  const enableResult = await safeSdk.executeTransaction(signedEnableModuleTx);
   await publicClient.waitForTransactionReceipt({
     hash: enableResult.hash as `0x${string}`,
   });
@@ -231,12 +284,13 @@ export async function deployUserSafe(userAddress: string): Promise<DeployResult>
     ownerAddress: userAddress,
     threshold: 2,
   });
-  const addOwnerResult = await safeSdk.executeTransaction(addOwnerTx);
+  const signedAddOwnerTx = await safeSdk.signTransaction(addOwnerTx);
+  const addOwnerResult = await safeSdk.executeTransaction(signedAddOwnerTx);
   await publicClient.waitForTransactionReceipt({
     hash: addOwnerResult.hash as `0x${string}`,
   });
 
   console.log(`[safe] User ${userAddress} added as owner, threshold set to 2`);
 
-  return { safeAddress, spendInteractorAddress, alreadyExists: false };
+  return { safeAddress, spendInteractorAddress };
 }
