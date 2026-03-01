@@ -20,7 +20,7 @@ import type { PrismaClient } from "@prisma/client";
 import type { Unlink } from "@unlink-xyz/node";
 import type { PublicClient } from "viem";
 import { AUDIT_ACTIONS, logAudit } from "./audit.js";
-import { debitBalance, InsufficientBalanceError } from "./ledger.js";
+import { debitBalance, hasSufficientBalance } from "./ledger.js";
 import { validateSpendIntent } from "./policy.js";
 
 // Default USDC decimals — used to convert 18-decimal USD to token units
@@ -139,29 +139,17 @@ export async function processProposal(
         ? amountBn / 10n ** BigInt(decimalDiff)
         : amountBn * 10n ** BigInt(-decimalDiff);
 
-    // Debit user ledger first (atomic — will throw if insufficient)
-    let newBalance: string;
-    try {
-      newBalance = await debitBalance(
-        prisma,
-        user.id,
-        "usd",
-        amount,
-        undefined,
-        `Path B transfer to ${recipient}`,
-      );
-    } catch (err) {
-      if (err instanceof InsufficientBalanceError) {
-        return {
-          approved: false,
-          status: "pending_review",
-          reason: "Insufficient deposited balance",
-        };
-      }
-      throw err;
+    // Pre-check balance (read-only) before attempting withdrawal
+    const hasFunds = await hasSufficientBalance(prisma, user.id, "usd", amount);
+    if (!hasFunds) {
+      return {
+        approved: false,
+        status: "pending_review",
+        reason: "Insufficient deposited balance",
+      };
     }
 
-    // Execute Unlink withdrawal to recipient
+    // Execute Unlink withdrawal to recipient first (before debiting ledger)
     const result = await unlink.withdraw({
       withdrawals: [
         {
@@ -171,6 +159,35 @@ export async function processProposal(
         },
       ],
     });
+
+    // Withdrawal succeeded — now debit user ledger
+    let newBalance: string;
+    try {
+      newBalance = await debitBalance(
+        prisma,
+        user.id,
+        "usd",
+        amount,
+        result.relayId,
+        `Path B transfer to ${recipient}`,
+      );
+    } catch (err) {
+      // Withdrawal already sent but ledger debit failed — log for reconciliation
+      await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_APPROVED, user.id, {
+        userAddress,
+        recipient,
+        amount,
+        relayId: result.relayId,
+        note: "Withdrawal succeeded but ledger debit failed — needs reconciliation",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      // Still return approved since funds were sent
+      return {
+        approved: true,
+        status: "approved",
+        relayId: result.relayId,
+      };
+    }
 
     const signResult: AutoSignResult = {
       approved: true,
@@ -193,11 +210,10 @@ export async function processProposal(
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
 
-    // Withdrawal failed — mark as pending_review (ledger was already debited,
-    // will need manual reconciliation or refund)
+    // Withdrawal failed — ledger was NOT debited, so no reconciliation needed
     const result: AutoSignResult = {
       approved: false,
-      status: "pending_review",
+      status: "rejected",
       reason: `Withdrawal failed: ${message}`,
     };
 
@@ -207,7 +223,6 @@ export async function processProposal(
       amount,
       error: message,
       reason: result.reason,
-      note: "Ledger may have been debited — needs reconciliation",
     });
 
     return result;
