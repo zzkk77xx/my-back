@@ -530,6 +530,62 @@ app.get("/users/:userAddress/cards", async (req: Request, res: Response) => {
   res.json({ cards, spendInteractorAddress: user.spendInteractorAddress });
 });
 
+// ─── PATCH /users/:userAddress/cards/:cardAddress ─────────────────────────────
+//
+// Updates the daily limit of an existing card EOA on the SpendInteractor.
+// Body: { dailyLimit: "1500000000000000000000" }
+
+app.patch(
+  "/users/:userAddress/cards/:cardAddress",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { userAddress, cardAddress } = req.params;
+    const { dailyLimit } = req.body as { dailyLimit: string };
+
+    if (!dailyLimit) {
+      res.status(400).json({ error: "dailyLimit is required" });
+      return;
+    }
+
+    if (!_walletClient) {
+      res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { address: userAddress.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const card = await prisma.cardEoa.findFirst({
+      where: { userId: user.id, address: cardAddress.toLowerCase() },
+    });
+    if (!card) {
+      res.status(404).json({ error: "Card not found for this user" });
+      return;
+    }
+
+    const txHash = await _walletClient.writeContract({
+      address: user.spendInteractorAddress as `0x${string}`,
+      abi: SPEND_INTERACTOR_ABI,
+      functionName: "updateLimit",
+      args: [cardAddress as `0x${string}`, BigInt(dailyLimit)],
+    });
+
+    await _publicClient.waitForTransactionReceipt({ hash: txHash });
+
+    await prisma.cardEoa.update({
+      where: { id: card.id },
+      data: { dailyLimit },
+    });
+
+    res.json({ txHash, cardAddress, dailyLimit });
+  },
+);
+
 // ─── GET /users/:userAddress/history ─────────────────────────────────────────
 //
 // Returns the user's activity feed from BalanceLedger (deposits, bank
