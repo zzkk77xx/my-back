@@ -28,7 +28,7 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { requirePrivyAuth } from "./auth.js";
-import { processProposal, type SafeTxProposal } from "./auto-sign.js";
+import { processProposal, type TransferIntent } from "./auto-sign.js";
 import { AUDIT_ACTIONS, logAudit, queryAuditLogs } from "./audit.js";
 import { creditBalance, getAllBalances } from "./ledger.js";
 import { validateSpendIntent } from "./policy.js";
@@ -823,45 +823,32 @@ app.delete(
   },
 );
 
-// ─── POST /safe/propose ──────────────────────────────────────────────────────
+// ─── POST /transfer/propose ──────────────────────────────────────────────────
 //
-// User submits a pre-signed Safe tx; bank validates guardrails, co-signs,
-// and executes on-chain (reaching the 2/2 threshold).
+// Path B: Signer submits a transfer intent; bank validates guardrails
+// (balance, velocity, $10k cap), then calls Unlink to send funds to recipient.
+// If guardrails fail → marked "pending_review" for manual confirmation.
 
 app.post(
-  "/safe/propose",
+  "/transfer/propose",
   requirePrivyAuth,
   async (req: Request, res: Response) => {
-    const proposal = req.body as SafeTxProposal;
+    const intent = req.body as TransferIntent;
 
-    if (
-      !proposal.safeAddress ||
-      !proposal.safeTx ||
-      !proposal.userSignature ||
-      !proposal.userAddress
-    ) {
+    if (!intent.userAddress || !intent.recipient || !intent.amount) {
       res.status(400).json({
-        error:
-          "safeAddress, safeTx, userSignature, and userAddress are required",
+        error: "userAddress, recipient, and amount are required",
       });
       return;
     }
 
-    if (!_adminAccount) {
-      res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
-      return;
-    }
-
-    const result = await processProposal(
-      prisma,
-      _publicClient,
-      process.env.ADMIN_PRIVATE_KEY!,
-      RPC_URL,
-      proposal,
-    );
+    const result = await processProposal(prisma, _publicClient, unlink, intent);
 
     if (result.approved) {
       res.json(result);
+    } else if (result.status === "pending_review") {
+      // 202 Accepted — intent received but needs manual review
+      res.status(202).json(result);
     } else {
       res.status(403).json(result);
     }

@@ -1,108 +1,88 @@
 /**
- * Bank auto-sign service.
+ * Bank auto-sign service — Path B (checking account / signer EOA).
  *
- * User proposes a Safe tx (pre-signed with their key), bank validates guardrails
- * via the policy engine, co-signs with the admin key to reach 2/2 threshold,
- * and executes on-chain.
+ * Flow:
+ *   1. Signer signs a transfer intent (amount, recipient, token).
+ *   2. Bank receives the intent and validates guardrails via the policy engine
+ *      (balance, velocity, $10k cap, on-chain limits).
+ *   3a. If approved → bank calls unlink.withdraw() to send funds from pool
+ *       to recipient, debits user ledger.
+ *   3b. If rejected → intent is marked "pending_review" for manual confirmation
+ *       (phone call or other out-of-band verification).
  *
  * All approve/reject decisions are recorded to the audit log.
+ *
+ * Note: This is NOT the debit-card path (Path A). Path A goes through
+ * SpendInteractor → event → watcher → Unlink withdrawal automatically.
  */
 
 import type { PrismaClient } from "@prisma/client";
-import Safe, { EthSafeSignature } from "@safe-global/protocol-kit";
-import { decodeFunctionData, type PublicClient } from "viem";
+import type { Unlink } from "@unlink-xyz/node";
+import type { PublicClient } from "viem";
 import { AUDIT_ACTIONS, logAudit } from "./audit.js";
-import { AUTO_SIGN_LIMIT_USD, validateSpendIntent } from "./policy.js";
+import { debitBalance, InsufficientBalanceError } from "./ledger.js";
+import { validateSpendIntent } from "./policy.js";
 
-// Minimal ERC-20 ABI for decoding transfer/approve calldata
-const ERC20_TRANSFER_ABI = [
-  {
-    type: "function",
-    name: "transfer",
-    inputs: [
-      { name: "to", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-    stateMutability: "nonpayable",
-  },
-  {
-    type: "function",
-    name: "approve",
-    inputs: [
-      { name: "spender", type: "address" },
-      { name: "amount", type: "uint256" },
-    ],
-    outputs: [{ name: "", type: "bool" }],
-    stateMutability: "nonpayable",
-  },
-] as const;
-
-// Default USDC decimals — used to convert token-unit amount to 18-decimal USD
-const USDC_DECIMALS = Number(process.env.DEFAULT_TOKEN_DECIMALS ?? 6);
+// Default USDC decimals — used to convert 18-decimal USD to token units
+const DEFAULT_TOKEN_DECIMALS = Number(process.env.DEFAULT_TOKEN_DECIMALS ?? 6);
+const DEFAULT_TOKEN_ADDRESS = (process.env.DEFAULT_TOKEN_ADDRESS ??
+  process.env.POOL_TOKEN_ADDRESS) as `0x${string}` | undefined;
 
 /**
- * Try to extract the ERC-20 transfer amount from calldata.
- * Returns the amount in 18-decimal USD, or null if not a transfer/approve call.
+ * Transfer intent submitted by the signer EOA (Path B).
  */
-function extractErc20Amount(data: string): bigint | null {
-  if (!data || data === "0x" || data.length < 10) return null;
-
-  try {
-    const { functionName, args } = decodeFunctionData({
-      abi: ERC20_TRANSFER_ABI,
-      data: data as `0x${string}`,
-    });
-
-    if (functionName === "transfer" || functionName === "approve") {
-      const tokenAmount = args[1] as bigint;
-      // Convert token units → 18-decimal USD (assuming 1:1 stablecoin)
-      const decimalDiff = 18 - USDC_DECIMALS;
-      return decimalDiff >= 0
-        ? tokenAmount * 10n ** BigInt(decimalDiff)
-        : tokenAmount / 10n ** BigInt(-decimalDiff);
-    }
-  } catch {
-    // Not a recognized ERC-20 call — that's fine
-  }
-
-  return null;
-}
-
-export interface SafeTxProposal {
-  safeAddress: string;
-  safeTx: {
-    to: string;
-    value: string;
-    data: string;
-    operation: number;
-    safeTxGas: string;
-    baseGas: string;
-    gasPrice: string;
-    gasToken: string;
-    refundReceiver: string;
-    nonce: number;
-  };
-  userSignature: string;
+export interface TransferIntent {
+  /** User's main address (signer EOA) */
   userAddress: string;
+  /** Recipient address for the transfer */
+  recipient: string;
+  /** Amount in 18-decimal USD string */
+  amount: string;
+  /** Token address (defaults to DEFAULT_TOKEN_ADDRESS / USDC) */
+  token?: string;
+  /** Optional signature proving the signer authorized this intent */
+  signature?: string;
 }
 
 export interface AutoSignResult {
   approved: boolean;
-  txHash?: string;
+  /** Unlink relay ID (on approval) */
+  relayId?: string;
+  /** Reason for rejection or pending_review */
   reason?: string;
+  /** "approved" | "pending_review" | "rejected" */
+  status: "approved" | "pending_review" | "rejected";
+  /** Remaining balance after debit (on approval) */
+  newBalance?: string;
 }
 
+/**
+ * Process a Path B transfer intent.
+ *
+ * Validates guardrails, then either:
+ * - Executes via Unlink withdrawal (approved)
+ * - Marks for manual review (pending_review)
+ */
 export async function processProposal(
   prisma: PrismaClient,
   publicClient: PublicClient,
-  adminPrivateKey: string,
-  rpcUrl: string,
-  proposal: SafeTxProposal,
+  unlink: Unlink,
+  intent: TransferIntent,
 ): Promise<AutoSignResult> {
-  const { safeAddress, safeTx, userSignature, userAddress } = proposal;
+  const { userAddress, recipient, amount, token } = intent;
 
-  // 1. Verify user exists and safeAddress matches
+  const tokenAddress = (token ?? DEFAULT_TOKEN_ADDRESS) as
+    | `0x${string}`
+    | undefined;
+  if (!tokenAddress) {
+    return {
+      approved: false,
+      status: "rejected",
+      reason: "No token address provided and DEFAULT_TOKEN_ADDRESS not set",
+    };
+  }
+
+  // 1. Verify user exists
   const user = await prisma.user.findUnique({
     where: { address: userAddress.toLowerCase() },
   });
@@ -110,134 +90,126 @@ export async function processProposal(
   if (!user) {
     const result: AutoSignResult = {
       approved: false,
+      status: "rejected",
       reason: "User not registered",
     };
     await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_REJECTED, null, {
       userAddress,
-      safeAddress,
+      recipient,
+      amount,
       reason: result.reason,
     });
     return result;
   }
 
-  if (user.safeAddress.toLowerCase() !== safeAddress.toLowerCase()) {
+  // 2. Policy validation (balance, velocity, $10k cap, on-chain limits)
+  const validation = await validateSpendIntent(prisma, publicClient, {
+    userAddress,
+    amount,
+  });
+
+  if (!validation.allowed) {
+    // Policy rejected → mark as pending_review for manual confirmation
+    // (phone call, email, or other out-of-band verification)
     const result: AutoSignResult = {
       approved: false,
-      reason: "Safe address does not match user's registered Safe",
+      status: "pending_review",
+      reason: validation.reason,
     };
+
     await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_REJECTED, user.id, {
       userAddress,
-      safeAddress,
-      expectedSafe: user.safeAddress,
+      recipient,
+      amount,
+      validation,
+      status: "pending_review",
       reason: result.reason,
     });
+
     return result;
   }
 
-  // 2. Determine the effective USD amount to validate.
-  //    - Native value transfers: use safeTx.value directly (already 18-dec)
-  //    - ERC-20 transfer/approve: decode calldata, convert token units → 18-dec USD
-  const txValue = BigInt(safeTx.value);
-  const erc20Amount = extractErc20Amount(safeTx.data);
-  const effectiveAmount = erc20Amount ?? txValue; // prefer ERC-20 if present
-
-  // 3. Amount cap check
-  if (effectiveAmount > AUTO_SIGN_LIMIT_USD) {
-    const result: AutoSignResult = {
-      approved: false,
-      reason: "Transaction amount exceeds auto-sign limit",
-    };
-    await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_REJECTED, user.id, {
-      userAddress,
-      safeAddress,
-      txValue: safeTx.value,
-      erc20Amount: erc20Amount?.toString() ?? null,
-      effectiveAmount: effectiveAmount.toString(),
-      reason: result.reason,
-    });
-    return result;
-  }
-
-  // 4. Policy validation (balance, velocity, on-chain limits)
-  if (effectiveAmount > 0n) {
-    const validation = await validateSpendIntent(prisma, publicClient, {
-      userAddress,
-      amount: effectiveAmount.toString(),
-    });
-
-    if (!validation.allowed) {
-      const result: AutoSignResult = {
-        approved: false,
-        reason: validation.reason,
-      };
-      await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_REJECTED, user.id, {
-        userAddress,
-        safeAddress,
-        erc20Amount: erc20Amount?.toString() ?? null,
-        effectiveAmount: effectiveAmount.toString(),
-        validation,
-        reason: result.reason,
-      });
-      return result;
-    }
-  }
-
-  // 5–8. Co-sign and execute
+  // 3. Approved — execute via Unlink withdrawal
   try {
-    const safeSdk = await Safe.init({
-      provider: rpcUrl,
-      signer: adminPrivateKey,
-      safeAddress,
-    });
+    // Convert 18-decimal USD amount to token units (e.g., 6 decimals for USDC)
+    const amountBn = BigInt(amount);
+    const decimalDiff = 18 - DEFAULT_TOKEN_DECIMALS;
+    const tokenAmount =
+      decimalDiff >= 0
+        ? amountBn / 10n ** BigInt(decimalDiff)
+        : amountBn * 10n ** BigInt(-decimalDiff);
 
-    const safeTransaction = await safeSdk.createTransaction({
-      transactions: [
+    // Debit user ledger first (atomic — will throw if insufficient)
+    let newBalance: string;
+    try {
+      newBalance = await debitBalance(
+        prisma,
+        user.id,
+        "usd",
+        amount,
+        undefined,
+        `Path B transfer to ${recipient}`,
+      );
+    } catch (err) {
+      if (err instanceof InsufficientBalanceError) {
+        return {
+          approved: false,
+          status: "pending_review",
+          reason: "Insufficient deposited balance",
+        };
+      }
+      throw err;
+    }
+
+    // Execute Unlink withdrawal to recipient
+    const result = await unlink.withdraw({
+      withdrawals: [
         {
-          to: safeTx.to,
-          value: safeTx.value,
-          data: safeTx.data,
-          operation: safeTx.operation,
+          token: tokenAddress,
+          amount: tokenAmount,
+          recipient: recipient as `0x${string}`,
         },
       ],
     });
 
-    // Apply the user's pre-computed signature
-    safeTransaction.addSignature(
-      new EthSafeSignature(userAddress, userSignature),
-    );
-
-    // Admin co-signs
-    const signedTx = await safeSdk.signTransaction(safeTransaction);
-
-    // Execute — reaches 2/2 threshold
-    const execResult = await safeSdk.executeTransaction(signedTx);
-
-    const result: AutoSignResult = {
+    const signResult: AutoSignResult = {
       approved: true,
-      txHash: execResult.hash,
+      status: "approved",
+      relayId: result.relayId,
+      newBalance,
     };
 
     await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_APPROVED, user.id, {
       userAddress,
-      safeAddress,
-      txHash: execResult.hash,
-      to: safeTx.to,
-      value: safeTx.value,
+      recipient,
+      amount,
+      tokenAmount: tokenAmount.toString(),
+      tokenAddress,
+      relayId: result.relayId,
+      newBalance,
     });
 
-    return result;
+    return signResult;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+
+    // Withdrawal failed — mark as pending_review (ledger was already debited,
+    // will need manual reconciliation or refund)
     const result: AutoSignResult = {
       approved: false,
-      reason: `Execution failed: ${message}`,
+      status: "pending_review",
+      reason: `Withdrawal failed: ${message}`,
     };
+
     await logAudit(prisma, AUDIT_ACTIONS.AUTO_SIGN_REJECTED, user.id, {
       userAddress,
-      safeAddress,
+      recipient,
+      amount,
       error: message,
       reason: result.reason,
+      note: "Ledger may have been debited — needs reconciliation",
     });
+
     return result;
   }
 }
