@@ -273,7 +273,8 @@ app.post(
 
     // Auto-generate a default spending card for new users (1 000 USD daily limit)
     if (_walletClient) {
-      const DEFAULT_DAILY_LIMIT = process.env.DEFAULT_CARD_DAILY_LIMIT ?? "1000000000000000000000"; // $1 000 (18 dec)
+      const DEFAULT_DAILY_LIMIT =
+        process.env.DEFAULT_CARD_DAILY_LIMIT ?? "1000000000000000000000"; // $1 000 (18 dec)
       try {
         const cardPrivateKey = generatePrivateKey();
         const cardAccount = privateKeyToAccount(cardPrivateKey);
@@ -503,6 +504,31 @@ app.post(
   },
 );
 
+// ─── GET /users/:userAddress/cards ────────────────────────────────────────────
+//
+// Returns only backend-managed cards (CardEoa table) for this user.
+// Unlike /eoas (which reads all on-chain registered EOAs), this only returns
+// cards whose private keys are stored server-side.
+
+app.get("/users/:userAddress/cards", async (req: Request, res: Response) => {
+  const { userAddress } = req.params;
+
+  const user = await prisma.user.findUnique({
+    where: { address: userAddress.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const cards = await prisma.cardEoa.findMany({
+    where: { userId: user.id },
+    select: { address: true, dailyLimit: true, createdAt: true },
+  });
+
+  res.json({ cards, spendInteractorAddress: user.spendInteractorAddress });
+});
+
 // ─── POST /users/:userAddress/cards/:cardAddress/spend ────────────────────────
 //
 // Signs and broadcasts an authorizeSpend transaction from the card's
@@ -549,6 +575,19 @@ app.post(
     }
 
     const cardAccount = privateKeyToAccount(card.privateKey as `0x${string}`);
+
+    // Auto-fund card if it doesn't have enough gas
+    const cardBalance = await _publicClient.getBalance({
+      address: cardAccount.address,
+    });
+    if (cardBalance < parseEther("0.1") && _walletClient) {
+      const fundHash = await _walletClient.sendTransaction({
+        to: cardAccount.address,
+        value: parseEther("1"),
+      });
+      await _publicClient.waitForTransactionReceipt({ hash: fundHash });
+    }
+
     const cardWalletClient = createWalletClient({
       account: cardAccount,
       transport: http(RPC_URL),
