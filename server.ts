@@ -26,6 +26,7 @@ import {
   encodePacked,
   http,
   keccak256,
+  parseEther,
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { requirePrivyAuth } from "./auth.js";
@@ -450,6 +451,13 @@ app.post(
 
     await _publicClient.waitForTransactionReceipt({ hash: txHash });
 
+    // Fund the new card EOA with 1 MON so it can pay gas for authorizeSpend
+    const fundTxHash = await _walletClient.sendTransaction({
+      to: cardAddress,
+      value: parseEther("1"),
+    });
+    await _publicClient.waitForTransactionReceipt({ hash: fundTxHash });
+
     await prisma.cardEoa.create({
       data: {
         userId: user.id,
@@ -459,7 +467,9 @@ app.post(
       },
     });
 
-    res.status(201).json({ address: cardAddress, dailyLimit, txHash });
+    res
+      .status(201)
+      .json({ address: cardAddress, dailyLimit, txHash, fundTxHash });
   },
 );
 
@@ -474,7 +484,11 @@ app.post(
   requirePrivyAuth,
   async (req: Request, res: Response) => {
     const { userAddress, cardAddress } = req.params;
-    const { amount, recipient, transferType = 1 } = req.body as {
+    const {
+      amount,
+      recipient,
+      transferType = 1,
+    } = req.body as {
       amount: string;
       recipient: string;
       transferType?: number;
