@@ -396,11 +396,23 @@ app.get("/account", async (_req: Request, res: Response) => {
 
 // ─── GET /balances ────────────────────────────────────────────────────────────
 
-app.get("/balances", async (_req: Request, res: Response) => {
-  const raw = await unlink.getBalances();
-  const balances = Object.fromEntries(
-    Object.entries(raw).map(([token, amount]) => [token, amount.toString()]),
-  );
+app.get("/balances", async (req: Request, res: Response) => {
+  const addr = req.query.addr as string | undefined;
+  if (!addr) {
+    res.status(400).json({ error: "Missing query param: addr" });
+    return;
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { address: addr.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  const rows = await getAllBalances(prisma, user.id);
+  const balances = Object.fromEntries(rows.map((r) => [r.token, r.balance]));
   res.json(balances);
 });
 
