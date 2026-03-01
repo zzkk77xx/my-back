@@ -69,6 +69,7 @@ model User {
   address                String   @unique @db.VarChar(42) // user EOA
   safeAddress            String   @db.VarChar(42)         // deployed 2/2 Safe
   spendInteractorAddress String   @db.VarChar(42)         // SpendInteractor module for this Safe
+  accountNumber          Int?     @unique                 // public-facing bank account number (starts at 100000)
   createdAt              DateTime @default(now())
 
   @@map("users")

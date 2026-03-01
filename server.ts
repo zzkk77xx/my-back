@@ -99,6 +99,7 @@ interface PendingDeposit {
   depositor: string; // user EOA
   token: string; // ERC-20 address
   amount: string; // token-unit amount string
+  beneficiaryUserId?: number; // user to credit (looked up via accountNumber)
 }
 const pendingDeposits = new Map<string, PendingDeposit>();
 
@@ -212,18 +213,29 @@ app.post(
       where: { address: normalized },
     });
     if (existing) {
-      res.json({ safeAddress: existing.safeAddress, created: false });
+      res.json({
+        safeAddress: existing.safeAddress,
+        accountNumber: existing.accountNumber,
+        created: false,
+      });
       return;
     }
 
     const { safeAddress, spendInteractorAddress } =
       await deployUserSafe(address);
 
+    // Generate next account number (starts at 100000)
+    const maxResult = await prisma.user.aggregate({
+      _max: { accountNumber: true },
+    });
+    const accountNumber = (maxResult._max.accountNumber ?? 99999) + 1;
+
     const user = await prisma.user.create({
       data: {
         address: normalized,
         safeAddress: safeAddress.toLowerCase(),
         spendInteractorAddress: spendInteractorAddress.toLowerCase(),
+        accountNumber,
       },
     });
 
@@ -257,7 +269,11 @@ app.post(
       update: {},
     });
 
-    res.status(201).json({ safeAddress: user.safeAddress, created: true });
+    res.status(201).json({
+      safeAddress: user.safeAddress,
+      accountNumber: user.accountNumber,
+      created: true,
+    });
   },
 );
 
@@ -395,10 +411,11 @@ app.get("/balances", async (_req: Request, res: Response) => {
 //   → client submits the tx, then calls /deposit/confirm
 
 app.post("/deposit/prepare", async (req: Request, res: Response) => {
-  const { depositor, token, amount } = req.body as {
+  const { depositor, token, amount, accountNumber } = req.body as {
     depositor: string;
     token: string;
     amount: string;
+    accountNumber?: number;
   };
 
   if (!depositor || !token || !amount) {
@@ -406,6 +423,19 @@ app.post("/deposit/prepare", async (req: Request, res: Response) => {
       .status(400)
       .json({ error: "depositor, token, and amount are required" });
     return;
+  }
+
+  // If accountNumber provided, resolve the beneficiary user
+  let beneficiaryUserId: number | undefined;
+  if (accountNumber != null) {
+    const beneficiary = await prisma.user.findUnique({
+      where: { accountNumber },
+    });
+    if (!beneficiary) {
+      res.status(404).json({ error: "Account number not found" });
+      return;
+    }
+    beneficiaryUserId = beneficiary.id;
   }
 
   const deposit = await unlink.deposit({
@@ -418,6 +448,7 @@ app.post("/deposit/prepare", async (req: Request, res: Response) => {
     depositor: depositor.toLowerCase(),
     token: token.toLowerCase(),
     amount,
+    beneficiaryUserId,
   });
 
   res.json({
@@ -449,9 +480,15 @@ app.post("/deposit/confirm", async (req: Request, res: Response) => {
   if (pending) {
     pendingDeposits.delete(relayId);
 
-    const user = await prisma.user.findUnique({
-      where: { address: pending.depositor },
-    });
+    // If accountNumber was provided at prepare time, credit that user directly;
+    // otherwise fall back to looking up by depositor address.
+    const user = pending.beneficiaryUserId
+      ? await prisma.user.findUnique({
+          where: { id: pending.beneficiaryUserId },
+        })
+      : await prisma.user.findUnique({
+          where: { address: pending.depositor },
+        });
 
     if (user) {
       // Convert token-unit amount → 18-decimal USD (assuming 1:1 stablecoin)
@@ -961,6 +998,22 @@ app.get("/users/:addr/balance", async (req: Request, res: Response) => {
   res.json({ balances });
 });
 
+// ─── GET /users/:addr/account-number ─────────────────────────────────────────
+
+app.get("/users/:addr/account-number", async (req: Request, res: Response) => {
+  const { addr } = req.params;
+
+  const user = await prisma.user.findUnique({
+    where: { address: addr.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
+
+  res.json({ accountNumber: user.accountNumber });
+});
+
 // ─── GET /audit ──────────────────────────────────────────────────────────────
 
 app.get("/audit", requirePrivyAuth, async (req: Request, res: Response) => {
@@ -1144,6 +1197,28 @@ app.use((err: unknown, _req: Request, res: Response) => {
 // ─── Start ────────────────────────────────────────────────────────────────────
 
 await initWallet();
+
+// Backfill account numbers for any existing users that don't have one
+const usersWithoutAccount = await prisma.user.findMany({
+  where: { accountNumber: null },
+  orderBy: { id: "asc" },
+});
+if (usersWithoutAccount.length > 0) {
+  const maxResult = await prisma.user.aggregate({
+    _max: { accountNumber: true },
+  });
+  let next = (maxResult._max.accountNumber ?? 99999) + 1;
+  for (const u of usersWithoutAccount) {
+    await prisma.user.update({
+      where: { id: u.id },
+      data: { accountNumber: next++ },
+    });
+  }
+  console.log(
+    `Backfilled account numbers for ${usersWithoutAccount.length} users (${next - usersWithoutAccount.length}–${next - 1})`,
+  );
+}
+
 startWatcher(prisma, unlink);
 startPoolMonitor(prisma, unlink);
 app.listen(PORT, () => {
