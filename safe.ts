@@ -126,10 +126,7 @@ async function loadBytecode(): Promise<`0x${string}`> {
   const { fileURLToPath } = await import("url");
 
   const dir = fileURLToPath(new URL(".", import.meta.url));
-  const artifactPath = resolve(
-    dir,
-    "../my-sc/out/SpendInteractor.sol/SpendInteractor.json",
-  );
+  const artifactPath = resolve(dir, "SpendInteractor.json");
   const artifact = JSON.parse(await readFile(artifactPath, "utf8"));
   return artifact.bytecode.object as `0x${string}`;
 }
