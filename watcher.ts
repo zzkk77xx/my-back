@@ -3,9 +3,8 @@
  *
  * Each poll cycle:
  *   1. Fetches SpendAuthorized events from Envio indexer (with RPC fallback).
- *   2. Persists new events with withdrawalStatus = "pending" and a random
- *      scheduledAt delay (timing decorrelation for privacy).
- *   3. Processes eligible events (scheduledAt <= now):
+ *   2. Persists new events with withdrawalStatus = "pending".
+ *   3. Processes eligible pending events:
  *        a. Resolves recipientHash → recipient address from RecipientMapping.
  *        b. Detects internal transfers (M2 → M2) and settles via ledger only.
  *        c. Converts the 18-decimal USD amount to the token's native decimals.
@@ -47,18 +46,18 @@ const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 30_000; // 30s base, doubles each retry
 
 // Timing decorrelation — random delay between auth event and execution
-const DECORRELATION_MIN_MS = Number(process.env.DECORRELATION_MIN_MS ?? 2_000);
-const DECORRELATION_MAX_MS = Number(process.env.DECORRELATION_MAX_MS ?? 30_000);
+// const DECORRELATION_MIN_MS = Number(process.env.DECORRELATION_MIN_MS ?? 2_000);
+// const DECORRELATION_MAX_MS = Number(process.env.DECORRELATION_MAX_MS ?? 30_000);
 
 // Exported for health check
 export let lastPollAt: Date | null = null;
 
-function randomDelay(): number {
-  return (
-    DECORRELATION_MIN_MS +
-    Math.random() * (DECORRELATION_MAX_MS - DECORRELATION_MIN_MS)
-  );
-}
+// function randomDelay(): number {
+//   return (
+//     DECORRELATION_MIN_MS +
+//     Math.random() * (DECORRELATION_MAX_MS - DECORRELATION_MIN_MS)
+//   );
+// }
 
 // ─── Public entry point ───────────────────────────────────────────────────────
 
@@ -228,7 +227,7 @@ async function fetchViaEnvio(
             transferType: e.transferType,
             nonce: e.nonce,
             withdrawalStatus: "pending",
-            scheduledAt: new Date(Date.now() + randomDelay()),
+            scheduledAt: new Date(),
           },
           update: {},
         }),
@@ -288,7 +287,7 @@ async function fetchViaRpc(
             transferType: log.args.transferType!,
             nonce: log.args.nonce!.toString(),
             withdrawalStatus: "pending",
-            scheduledAt: new Date(Date.now() + randomDelay()),
+            scheduledAt: new Date(),
           },
           update: {},
         }),
@@ -308,17 +307,12 @@ async function fetchViaRpc(
 async function processEligibleEvents(prisma: PrismaClient, unlink: Unlink) {
   const now = new Date();
 
-  // Fetch pending events whose scheduledAt has passed + failed events eligible for retry
+  // Fetch pending + retryable events
   const events = await prisma.spendAuthorizedEvent.findMany({
     where: {
       OR: [
         {
           withdrawalStatus: "pending",
-          scheduledAt: { lte: now },
-        },
-        {
-          withdrawalStatus: "pending",
-          scheduledAt: null, // legacy events without scheduledAt
         },
         {
           withdrawalStatus: "failed",
