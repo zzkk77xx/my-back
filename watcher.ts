@@ -38,7 +38,7 @@ const SPEND_AUTHORIZED = parseAbiItem(
 );
 
 const META_KEY = "last_processed_block";
-const POLL_INTERVAL = Number(process.env.WATCHER_POLL_INTERVAL_MS ?? 10_000);
+const POLL_INTERVAL = Number(process.env.WATCHER_POLL_INTERVAL_MS ?? 3_000);
 const ENVIO_GRAPHQL_URL = process.env.ENVIO_GRAPHQL_URL;
 
 // Retry logic
