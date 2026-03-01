@@ -1343,7 +1343,7 @@ app.post(
 
 // ─── Error handler ────────────────────────────────────────────────────────────
 
-app.use((err: unknown, _req: Request, res: Response) => {
+app.use((err: unknown, _req: Request, res: Response, _next: Function) => {
   const message = err instanceof Error ? err.message : String(err);
   console.error("Unhandled error:", message);
   res.status(500).json({ error: message });
