@@ -102,10 +102,11 @@ export async function processProposal(
     return result;
   }
 
-  // 2. Policy validation (balance, velocity, $10k cap, on-chain limits)
+  // 2. Policy validation (balance, velocity, $10k cap — skip on-chain card limits for Path B)
   const validation = await validateSpendIntent(prisma, publicClient, {
     userAddress,
     amount,
+    skipOnChainChecks: true,
   });
 
   if (!validation.allowed) {
