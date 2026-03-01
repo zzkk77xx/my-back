@@ -86,6 +86,7 @@ async function initWallet() {
     chain: "monad-testnet",
     setup: false,
     sync: false,
+    autoSync: true,
   });
   await unlink.seed.importMnemonic(MNEMONIC!);
   await unlink.accounts.create();

@@ -149,6 +149,9 @@ export async function processProposal(
       };
     }
 
+    // Sync Unlink state to pick up latest on-chain note status
+    await unlink.sync();
+
     // Execute Unlink withdrawal to recipient first (before debiting ledger)
     const result = await unlink.withdraw({
       withdrawals: [

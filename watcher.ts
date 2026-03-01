@@ -476,6 +476,9 @@ async function processEligibleEvents(prisma: PrismaClient, unlink: Unlink) {
           `→ ${recipient} for event id=${event.id}`,
       );
 
+      // Sync Unlink state to pick up latest on-chain note status
+      await unlink.sync();
+
       const result = await unlink.withdraw({
         withdrawals: [
           {
