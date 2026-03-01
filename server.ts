@@ -582,11 +582,9 @@ app.post(
     });
     if (cardBalance < parseEther("0.1")) {
       if (!_walletClient) {
-        res
-          .status(500)
-          .json({
-            error: "Card has no gas and ADMIN_PRIVATE_KEY not configured",
-          });
+        res.status(500).json({
+          error: "Card has no gas and ADMIN_PRIVATE_KEY not configured",
+        });
         return;
       }
       try {
@@ -619,9 +617,23 @@ app.post(
       args: [BigInt(amount), recipientHash, transferType],
     });
 
+    // Estimate gas ourselves with a buffer; fall back to fixed limit on failure
+    let gas: bigint;
+    try {
+      const estimated = await _publicClient.estimateGas({
+        account: cardAccount,
+        to: user.spendInteractorAddress as `0x${string}`,
+        data: calldata,
+      });
+      gas = (estimated * 150n) / 100n; // +50% buffer
+    } catch {
+      gas = 300_000n;
+    }
+
     const txHash = await cardWalletClient.sendTransaction({
       to: user.spendInteractorAddress as `0x${string}`,
       data: calldata,
+      gas,
     });
 
     res.json({ txHash });
