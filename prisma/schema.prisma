@@ -109,6 +109,19 @@ model BalanceLedger {
   @@map("balance_ledger")
 }
 
+// Backend-generated card EOAs — private key stored server-side
+model CardEoa {
+  id         Int      @id @default(autoincrement())
+  userId     Int
+  address    String   @unique @db.VarChar(42) // 0x-prefixed derived address
+  privateKey String   @db.VarChar(66)         // 0x-prefixed hex private key
+  dailyLimit String                            // 18-decimal wei string
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@map("card_eoas")
+}
+
 // M1 internal trading desk sub-accounts managed by bank operators
 model SubAccount {
   id           Int      @id @default(autoincrement())

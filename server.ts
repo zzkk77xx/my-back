@@ -22,11 +22,12 @@ import express, { type Request, type Response } from "express";
 import {
   createPublicClient,
   createWalletClient,
+  encodeFunctionData,
   encodePacked,
   http,
   keccak256,
 } from "viem";
-import { privateKeyToAccount } from "viem/accounts";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { requirePrivyAuth } from "./auth.js";
 import { processProposal, type TransferIntent } from "./auto-sign.js";
 import { AUDIT_ACTIONS, logAudit, queryAuditLogs } from "./audit.js";
@@ -384,6 +385,148 @@ app.delete(
     await _publicClient.waitForTransactionReceipt({ hash: txHash });
 
     res.json({ txHash, eoa });
+  },
+);
+
+// ─── POST /users/:userAddress/cards ───────────────────────────────────────────
+//
+// Generates a new EOA keypair server-side, registers it on the user's
+// SpendInteractor with the given daily limit, persists the private key,
+// and returns the new card address.
+// Body: { dailyLimit: "1000000000000000000", allowedTypes?: [0, 1] }
+
+const AUTHORIZE_SPEND_ABI = [
+  {
+    type: "function",
+    name: "authorizeSpend",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "recipientHash", type: "bytes32" },
+      { name: "transferType", type: "uint8" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+] as const;
+
+app.post(
+  "/users/:userAddress/cards",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { userAddress } = req.params;
+    const { dailyLimit, allowedTypes = [0, 1] } = req.body as {
+      dailyLimit: string;
+      allowedTypes?: number[];
+    };
+
+    if (!dailyLimit) {
+      res.status(400).json({ error: "dailyLimit is required" });
+      return;
+    }
+
+    if (!_walletClient || !_adminAccount) {
+      res.status(500).json({ error: "ADMIN_PRIVATE_KEY not configured" });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { address: userAddress.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const privateKey = generatePrivateKey();
+    const account = privateKeyToAccount(privateKey);
+    const cardAddress = account.address;
+
+    const txHash = await _walletClient.writeContract({
+      address: user.spendInteractorAddress as `0x${string}`,
+      abi: SPEND_INTERACTOR_ABI,
+      functionName: "registerEOA",
+      args: [cardAddress, BigInt(dailyLimit), allowedTypes],
+    });
+
+    await _publicClient.waitForTransactionReceipt({ hash: txHash });
+
+    await prisma.cardEoa.create({
+      data: {
+        userId: user.id,
+        address: cardAddress.toLowerCase(),
+        privateKey,
+        dailyLimit,
+      },
+    });
+
+    res.status(201).json({ address: cardAddress, dailyLimit, txHash });
+  },
+);
+
+// ─── POST /users/:userAddress/cards/:cardAddress/spend ────────────────────────
+//
+// Signs and broadcasts an authorizeSpend transaction from the card's
+// backend-stored private key.
+// Body: { amount: "1000000000000000000", recipient: "0x...", transferType?: 1 }
+
+app.post(
+  "/users/:userAddress/cards/:cardAddress/spend",
+  requirePrivyAuth,
+  async (req: Request, res: Response) => {
+    const { userAddress, cardAddress } = req.params;
+    const { amount, recipient, transferType = 1 } = req.body as {
+      amount: string;
+      recipient: string;
+      transferType?: number;
+    };
+
+    if (!amount || !recipient) {
+      res.status(400).json({ error: "amount and recipient are required" });
+      return;
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { address: userAddress.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const card = await prisma.cardEoa.findFirst({
+      where: {
+        userId: user.id,
+        address: cardAddress.toLowerCase(),
+      },
+    });
+    if (!card) {
+      res.status(404).json({ error: "Card not found for this user" });
+      return;
+    }
+
+    const cardAccount = privateKeyToAccount(card.privateKey as `0x${string}`);
+    const cardWalletClient = createWalletClient({
+      account: cardAccount,
+      transport: http(RPC_URL),
+      chain: _chain,
+    });
+
+    const recipientHash = keccak256(
+      encodePacked(["address"], [recipient as `0x${string}`]),
+    );
+
+    const calldata = encodeFunctionData({
+      abi: AUTHORIZE_SPEND_ABI,
+      functionName: "authorizeSpend",
+      args: [BigInt(amount), recipientHash, transferType],
+    });
+
+    const txHash = await cardWalletClient.sendTransaction({
+      to: user.spendInteractorAddress as `0x${string}`,
+      data: calldata,
+    });
+
+    res.json({ txHash });
   },
 );
 
