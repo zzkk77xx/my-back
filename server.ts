@@ -270,6 +270,36 @@ app.post(
       update: {},
     });
 
+    // Auto-generate a default spending card for new users (1 000 USD daily limit)
+    if (_walletClient) {
+      const DEFAULT_DAILY_LIMIT = process.env.DEFAULT_CARD_DAILY_LIMIT ?? "1000000000000000000000"; // $1 000 (18 dec)
+      try {
+        const cardPrivateKey = generatePrivateKey();
+        const cardAccount = privateKeyToAccount(cardPrivateKey);
+        const cardAddress = cardAccount.address;
+
+        const cardTxHash = await _walletClient.writeContract({
+          address: spendInteractorAddress as `0x${string}`,
+          abi: SPEND_INTERACTOR_ABI,
+          functionName: "registerEOA",
+          args: [cardAddress, BigInt(DEFAULT_DAILY_LIMIT), [0, 1]],
+        });
+        await _publicClient.waitForTransactionReceipt({ hash: cardTxHash });
+
+        await prisma.cardEoa.create({
+          data: {
+            userId: user.id,
+            address: cardAddress.toLowerCase(),
+            privateKey: cardPrivateKey,
+            dailyLimit: DEFAULT_DAILY_LIMIT,
+          },
+        });
+      } catch (e) {
+        // Non-fatal: user is registered, they can add a card manually later
+        console.error("[register] failed to auto-create spending card:", e);
+      }
+    }
+
     res.status(201).json({
       safeAddress: user.safeAddress,
       accountNumber: user.accountNumber,
