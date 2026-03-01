@@ -504,7 +504,7 @@ async function processEligibleEvents(prisma: PrismaClient, unlink: Unlink) {
             "usd",
             event.amount,
             result.relayId,
-            `withdrawal event id=${event.id}`,
+            `card payment to ${recipient}`,
           );
         } catch (debitErr) {
           if (debitErr instanceof InsufficientBalanceError) {

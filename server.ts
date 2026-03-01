@@ -530,6 +530,44 @@ app.get("/users/:userAddress/cards", async (req: Request, res: Response) => {
   res.json({ cards, spendInteractorAddress: user.spendInteractorAddress });
 });
 
+// ─── GET /users/:userAddress/history ─────────────────────────────────────────
+//
+// Returns the user's activity feed from BalanceLedger (deposits, bank
+// transfers, card payments, refunds), newest first.
+// Query params: ?limit=50
+
+app.get(
+  "/users/:userAddress/history",
+  async (req: Request, res: Response) => {
+    const { userAddress } = req.params;
+    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+
+    const user = await prisma.user.findUnique({
+      where: { address: userAddress.toLowerCase() },
+    });
+    if (!user) {
+      res.status(404).json({ error: "User not found" });
+      return;
+    }
+
+    const ledger = await prisma.balanceLedger.findMany({
+      where: { userId: user.id },
+      orderBy: { createdAt: "desc" },
+      take: limit,
+    });
+
+    res.json(
+      ledger.map((e) => ({
+        type: e.type, // "deposit" | "spend" | "refund"
+        amount: e.amount,
+        reference: e.reference ?? null,
+        note: e.note ?? null,
+        createdAt: e.createdAt.toISOString(),
+      })),
+    );
+  },
+);
+
 // ─── POST /users/:userAddress/cards/:cardAddress/spend ────────────────────────
 //
 // Signs and broadcasts an authorizeSpend transaction from the card's
