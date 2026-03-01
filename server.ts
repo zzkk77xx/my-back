@@ -154,7 +154,7 @@ app.get("/health", async (_req: Request, res: Response) => {
 
   // Pool check
   try {
-    const poolStatus = await getPoolStatus(unlink);
+    const poolStatus = await getPoolStatus(unlink, _publicClient);
     components.pool = {
       status: "up",
       isHealthy: poolStatus.isHealthy,
@@ -592,37 +592,34 @@ app.patch(
 // transfers, card payments, refunds), newest first.
 // Query params: ?limit=50
 
-app.get(
-  "/users/:userAddress/history",
-  async (req: Request, res: Response) => {
-    const { userAddress } = req.params;
-    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+app.get("/users/:userAddress/history", async (req: Request, res: Response) => {
+  const { userAddress } = req.params;
+  const limit = Math.min(Number(req.query.limit ?? 50), 200);
 
-    const user = await prisma.user.findUnique({
-      where: { address: userAddress.toLowerCase() },
-    });
-    if (!user) {
-      res.status(404).json({ error: "User not found" });
-      return;
-    }
+  const user = await prisma.user.findUnique({
+    where: { address: userAddress.toLowerCase() },
+  });
+  if (!user) {
+    res.status(404).json({ error: "User not found" });
+    return;
+  }
 
-    const ledger = await prisma.balanceLedger.findMany({
-      where: { userId: user.id },
-      orderBy: { createdAt: "desc" },
-      take: limit,
-    });
+  const ledger = await prisma.balanceLedger.findMany({
+    where: { userId: user.id },
+    orderBy: { createdAt: "desc" },
+    take: limit,
+  });
 
-    res.json(
-      ledger.map((e) => ({
-        type: e.type, // "deposit" | "spend" | "refund"
-        amount: e.amount,
-        reference: e.reference ?? null,
-        note: e.note ?? null,
-        createdAt: e.createdAt.toISOString(),
-      })),
-    );
-  },
-);
+  res.json(
+    ledger.map((e) => ({
+      type: e.type, // "deposit" | "spend" | "refund"
+      amount: e.amount,
+      reference: e.reference ?? null,
+      note: e.note ?? null,
+      createdAt: e.createdAt.toISOString(),
+    })),
+  );
+});
 
 // ─── POST /users/:userAddress/cards/:cardAddress/spend ────────────────────────
 //
@@ -1286,7 +1283,7 @@ app.post(
 // ─── GET /pool/status ────────────────────────────────────────────────────────
 
 app.get("/pool/status", async (_req: Request, res: Response) => {
-  const status = await getPoolStatus(unlink);
+  const status = await getPoolStatus(unlink, _publicClient);
 
   // Attach token decimals from watched contracts table (defaults to 6 for USDC)
   let tokenDecimals = 6;
@@ -1580,7 +1577,7 @@ if (usersWithoutAccount.length > 0) {
 }
 
 startWatcher(prisma, unlink);
-startPoolMonitor(prisma, unlink);
+startPoolMonitor(prisma, unlink, _publicClient);
 app.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
 });
