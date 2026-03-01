@@ -580,12 +580,27 @@ app.post(
     const cardBalance = await _publicClient.getBalance({
       address: cardAccount.address,
     });
-    if (cardBalance < parseEther("0.1") && _walletClient) {
-      const fundHash = await _walletClient.sendTransaction({
-        to: cardAccount.address,
-        value: parseEther("1"),
-      });
-      await _publicClient.waitForTransactionReceipt({ hash: fundHash });
+    if (cardBalance < parseEther("0.1")) {
+      if (!_walletClient) {
+        res
+          .status(500)
+          .json({
+            error: "Card has no gas and ADMIN_PRIVATE_KEY not configured",
+          });
+        return;
+      }
+      try {
+        const fundHash = await _walletClient.sendTransaction({
+          to: cardAccount.address,
+          value: parseEther("1"),
+        });
+        await _publicClient.waitForTransactionReceipt({ hash: fundHash });
+      } catch (fundErr) {
+        const msg =
+          fundErr instanceof Error ? fundErr.message : String(fundErr);
+        res.status(500).json({ error: `Failed to fund card with gas: ${msg}` });
+        return;
+      }
     }
 
     const cardWalletClient = createWalletClient({
